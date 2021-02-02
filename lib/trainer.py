@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 import lib.ops
-from lib.data import linelen, form_adaptive_batches
+from lib.data import linelen, form_adaptive_batches, form_adaptive_batches_grouped
 from lib.oracle import inserts_coo_to_tensor, batch_inserts_to_coo, GenerateReferenceInserts
 from lib.inference import SampleReferenceInserts
 from lib.util import nested_map, nested_flatten, get_optimized_variables, initialize_uninitialized_variables, make_symbolic_cache
@@ -47,6 +47,9 @@ class SampleBasedTrainer:
             # step 2: path_sampler samples a batch of trajectories (sequences of inserts)
             # it also caches encoder state for efficiency
             self.path_sampler = SampleReferenceInserts(model, **(sampler_opts or {}), enc_state=self.cached_enc_state)
+            #NOTE(prkriley): path_sampler records self.chosen_insert_logprobs of shape [batch], useful for P/Q
+            #NOTE(prkriley): already includes masking, so I think the probs correspond to Q?
+            #NOTE(prkriley): NO, masking only restricts sampling but does NOT calculate renormalization, so that value is P
             self.cached_enc_state = nested_map(tf.stop_gradient, self.cached_enc_state)
             self.cached_grad_wrt_enc = nested_map(lambda v: tf.Variable(tf.zeros([]), validate_shape=False,
                                                                         trainable=False,
@@ -142,7 +145,7 @@ class SampleBasedTrainer:
                 initialize_uninitialized_variables(sess=sess, var_list=remaining_utility_variables)
 
 
-    def train_on_batch(self, batch, slice_max_len=None, optimizer_step=True, reset_counters=None):
+    def train_on_batch(self, batch, slice_max_len=None, optimizer_step=True, reset_counters=None, grouped=False):
         """
         Accumulates gradients and counters,
         :param batch: a list of pairs [(inp_line, out_line), ...]
@@ -162,18 +165,31 @@ class SampleBasedTrainer:
 
         # step 2: sample insert trajectories, cache encoder state
         batch_trajectories = list(self.path_sampler.generate_trajectories(batch, sess))
+        #NOTE(prkriley): batch_trajectories elements will have the logp_any_ref in them somewhere
+        #NOTE(prkriley): length of batch_trajectories is less than batch_size*max_len
 
         sess.run(self.fetch_before_batch)
 
         # step 3: process hypos with decoder, accumulate gradients at encoder
         # 3.1 split data into slices
 
+        #TODO(prkriley): determine how to figure out which entries are the same hypothesis; perhaps an id field in generate_trajectories?
+        #NOTE(prkriley): yes, out_to_inp_indices is just a list with the id for each element
+        #TODO(prkriley): make sure that all elements for the same input show up in a single slice
+
         if slice_max_len is None:
             slices = [batch_trajectories]
         else:
-            slices = form_adaptive_batches(batch_trajectories,
-                                           slice_max_len,
-                                           cost_func=lambda row: linelen(row['hypo']))
+            #TODO(prkriley): figure out how to do accumulation properly with slicing; may be impossible!!
+            #NOTE(prkriley): unless modify form_adaptive batches to put those from same entry in same slice...
+            if grouped:
+                slices = form_adaptive_batches_grouped(batch_trajectories,
+                                               slice_max_len,
+                                               cost_func=lambda row: linelen(row['hypo']))
+            else:
+                slices = form_adaptive_batches(batch_trajectories,
+                                               slice_max_len,
+                                               cost_func=lambda row: linelen(row['hypo']))
 
         # 3.2 process hypos one slice at a time
         for slice in slices:
@@ -186,11 +202,14 @@ class SampleBasedTrainer:
             slice_feed['chosen_inserts'] = batch_inserts_to_coo(slice_feed['chosen_inserts'], model.out_voc)
             slice_feed['ref_len'] = [reference_lengths[i] for i in slice_feed['out_to_inp_indices']]
 
+            #NOTE(prkriley): this accumulates gradients from this slice, which are optimized later; fetch_on_slice has side-effects of doing that
+            #NOTE(prkriley): to determine whether [batch] has all timesteps, look into slice_feed; UPDATE: it does
             sess.run(self.fetch_on_slice, {self.slice_ph[k]: slice_feed[k] for k in self.slice_ph})
 
         # step 4. compute remaining gradients through encoder
         encoder_feed = self.model.make_feed_dict(batch)
 
+        #TODO(prkriley): look at what these gradients are and whether they need any P/Q business
         sess.run(self.fetch_after_batch,
                  {self.encoder_batch_ph[k]: encoder_feed[k] for k in self.encoder_batch_ph})
 
@@ -207,14 +226,24 @@ class SampleBasedTrainer:
         return metrics
 
     def get_loss_and_counters(self, batch_ph, cached_enc_state, is_train,
-                              eos_coeff=None, entropy_reg=0.0, loss_use_logp_any_ref=True):
+                              eos_coeff=None, entropy_reg=0.0, loss_use_logp_any_ref=True, loss_use_PQ=False):
+        #NOTE(prkriley): I believe batch_ph should have the logp_any_ref key which should be a list, I THINK for every timestep for each batch entry
+        #NOTE(prkriley): OK, not sure whether entries are lists now...
+        #NOTE(prkriley): logp is definitely the whole batch, but not sure about time; I suspect one timestep
+        #NOTE(prkriley): is it possible that the [batch] dim is actually [batch*time]? No real evidence of this, just brainstorming
+        #NOTE(prkriley): confirmed: batch dimension is something less than [batch*time]; there is an id field (out_to_inp_indices) indicating which is which; need to accumulate P/Q accordingly
+
         # encode with cached enc state
         enc_batch_size = tf.shape(cached_enc_state['out'])[0]
         with tf.control_dependencies([tf.assert_equal(tf.shape(tensor)[0], enc_batch_size)
                                       for tensor in nested_flatten(cached_enc_state)]):
+            #NOTE(prkriley): this is the id logic for reordering, can do something similar for accumulation for P/Q
             enc_reordered = {k: tf.gather(v, batch_ph['out_to_inp_indices'])
                              for k, v in cached_enc_state.items()}
 
+        #TODO(prkriley): determine why compute_action_logprobs is called here AND in SampleReferenceInserts
+        #NOTE(prkriley): something about train vs. inference? doesn't make sense
+        #NOTE(prkriley): constructor for SampleReferenceInserts calls compute_action_logprobs but doesn't use it, so likely TF-lazy
         logp = self.model.compute_action_logprobs(batch_ph, is_train=is_train, enc=enc_reordered)
         insert_logprobas = logp['insert']  # [batch, nout, voc_size]
         finish_logprobas = logp['finish']  # [batch]
@@ -232,16 +261,30 @@ class SampleBasedTrainer:
         ref_logp = tf.where(is_ref_insert, insert_logprobas, neg_inf_like_logp)
         chosen_logp = tf.where(is_chosen_insert, insert_logprobas, neg_inf_like_logp)
 
+        #TODO(prkriley): make sure loss_use_logp_any_ref is False
+        #NOTE(prkriley): log(P/Q) is tf.reduce_logsumexp(ref_logp, axis=(1,2)) which is shape [batch_size]
+        #NOTE(prkriley): still need to accumulate, duplicate, stop-grad, and multiply by logp_ref_inserts
+        #NOTE(prkriley): look into tf.unsorted_segment_sum; I think enc_batch_size is true batch size
         logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(1, 2))
         # ^-- [batch_size]
 
         should_finish = tf.reduce_any(is_ref_insert[:, :, self.model.out_voc.eos], axis=-1)
 
+        log_PQ_ratio = tf.where(should_finish, finish_logprobas, tf.reduce_logsumexp(ref_logp, axis=(1,2)))
+
+        accumulated_log_PQ_ratio = tf.unsorted_segment_sum(log_PQ_ratio, batch_ph['out_to_inp_indices'], enc_batch_size) #[enc_batch_size]
+        expanded_PQ = tf.stop_gradient(tf.gather(tf.exp(accumulated_log_PQ_ratio), batch_ph['out_to_inp_indices'])) #[batch_size]
+
         xent_values = -tf.where(should_finish, finish_logprobas, logp_ref_inserts)
         # ^-- [batch_size]
+        if loss_use_PQ:
+          xent_values = xent_values * expanded_PQ
 
         # reweighting
+        #NOTE(prkriley): I believe this is always None, though may want to check programmatically; possible it is set in a function call without keyword
         if eos_coeff is None:
+            #TODO(prkriley): scale by P/Q values
+            #NOTE(prkriley): I think this is one timestep, but we won't know actual values until the end? FIND THE TIMESTEP CONTROL LOOP
             xent_numerator = tf.reduce_sum(xent_values)
         else:
             samples_per_line = tf.to_float(batch_ph['ref_len'])
@@ -260,6 +303,7 @@ class SampleBasedTrainer:
         # assemble loss (crossentropy with some extra steps)
         loss_numerator = xent_numerator
 
+        #NOTE(prkriley): I believe entropy_reg is always 0 for us
         if entropy_reg != 0.0:
             insert_probas = tf.exp(insert_logprobas)  # [batch_size, nout, voc_size]
             insert_p_logp_sum = tf.reduce_sum(insert_probas * insert_logprobas, axis=2)  # [batch_size, nout]

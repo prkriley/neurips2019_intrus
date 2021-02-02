@@ -4,6 +4,7 @@ Utility functions to compute optimal actions for a given source hypo
 import random
 import tensorflow as tf
 import numpy as np
+import sys
 
 
 def get_optimal_inserts(cand, ref):
@@ -27,6 +28,7 @@ def get_optimal_inserts(cand, ref):
                 starts.append(ref_pos + 1)
                 break
         else:
+            print('Bogus cand / ref: {} / {}'.format(cand,ref))
             raise ValueError("cand must be a sub-sequence of ref")
 
     ends = [len(ref)]
@@ -37,6 +39,7 @@ def get_optimal_inserts(cand, ref):
                 ends.append(ref_pos)
                 break
         else:
+            print('Bogus cand / ref: {} / {}'.format(cand,ref))
             raise ValueError("cand must be a sub-sequence of ref")
     ends = ends[::-1]
 
@@ -76,8 +79,14 @@ def generate_insert_trajectory(ref, hypo=(), choice=lambda hypo, ref, inserts: r
     :returns: an iterator over triples (hypo, optimal_inserts, chosen_insert)
     """
     hypo = list(hypo)
+    DEBUG_it = -1
     while True:
-        inserts = get_optimal_inserts(hypo, ref)
+        DEBUG_it += 1
+        try:
+          inserts = get_optimal_inserts(hypo, ref)
+        except ValueError as e:
+          print('Dying in iteration {} of generate_insert_trajectory with ref {}'.format(DEBUG_it, ref), file=sys.stderr)
+          raise e
         flat_inserts = [(i, token) for i, tokens in enumerate(inserts) for token in tokens]
         if not len(flat_inserts):
             yield hypo, [set() for _ in range(len(hypo) + 1)], None

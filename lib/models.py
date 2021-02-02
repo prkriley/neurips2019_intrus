@@ -101,6 +101,8 @@ class Transformer:
         enc = self.encode(batch, is_train) if enc is None else enc
         with tf.name_scope(self.name), ops.dropout_scope(is_train):
             out = batch['out']  # partial translation, shape: [batch_size * nout]
+            #NOTE(prkriley): above shape may actually be [batch_size, nout], just based on ops.infer_length, UNLESS out_len is already provided so infer_length isn't called...
+            #NOTE(prkriley): no, it is CLEARLY 2D; look at out_padded
             out_len = batch.get('out_len', ops.infer_length(out, self.out_voc.eos))  # [batch]
 
             # embedding. Note: at this point, a special "zero" vector is added
@@ -129,7 +131,7 @@ class Transformer:
             position_mask = tf.cast(attn_mask, tf.bool)[:, 0, 0, :]  # [batch_size, nout + 1]
             position_logits = tf.where(position_mask, position_logits,
                                        tf.fill(tf.shape(position_logits), -1e9))
-            position_logp = tf.nn.log_softmax(position_logits, axis=-1)  # [batch_size, n_out]
+            position_logp = tf.nn.log_softmax(position_logits, axis=-1)  # [batch_size, n_out] #NOTE(prkriley): n_out+1
 
             # two actions: insert - at any non-EOS position - or finish - defined as inserting at EOS
             finish_logp = tf.gather_nd(position_logp,

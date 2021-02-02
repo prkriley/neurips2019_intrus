@@ -6,6 +6,7 @@ import tensorflow as tf
 import lib.ops
 from lib.oracle import get_optimal_inserts, inserts_coo_to_tensor, batch_inserts_to_coo
 from lib.util import nested_flatten, nested_map, make_batch_placeholder
+import sys
 
 
 class BeamSearchInserts:
@@ -184,6 +185,10 @@ class SampleReferenceInserts:
                                    tf.fill(tf.shape(action_logp['insert']), -float('inf')))
 
         logprobs_flat = tf.reshape(masked_logprobs, [tf.shape(action_logp['insert'])[0], -1])  # [batch, time*voc_size]
+        #TODO(prkriley): compute renormalization to get Q values
+        #NOTE(prkriley): ['insert'] is [batch, time, voc_size]; for each batch entry, item [t][v] is log_prob of inserting vocab item v at position t which is logp(t) + logp(v|t) = log(p(t) * p(v|t))
+        #NOTE(prkriley): I think we can use logsumexp to determine the new normalization to get Q (or log Q)
+        #NOTE(prkriley): That is exactly what logp_any_ref is
 
         if greedy:
             chosen_index_flat = tf.argmax(logprobs_flat, axis=1)
@@ -199,7 +204,20 @@ class SampleReferenceInserts:
         )
 
         is_terminated = tf.equal(chosen_token_ix, model.out_voc.eos)
-        self.chosen_insert_logprobs = tf.where(is_terminated, action_logp['finish'], chosen_insert_logprobs)
+        self.chosen_insert_logprobs = tf.where(is_terminated, action_logp['finish'], chosen_insert_logprobs) 
+        #NOTE(prkriley): self.chosen_insert_logprobs is [batch] and has the logprobs of choices of pos and tok
+        #TODO(prkriley): understand and account for the action_logp['finish'] business
+        #NOTE(prkriley): recap: self.chosen_insert_logprobs is log_P, and log_Q is self.chosen_insert_logprobs - self.logp_any_ref 
+        #NOTE(prkriley): which means log(P/Q)_i is self.logp_any_ref? Note that this is of course for one timestep, need to sum to get full log(P/Q)
+        #TODO(prkriley): check action_logp['finish'], could invalidate above derivation
+        #NOTE(prkriley): exp of sum of ['insert'] isn't 1; need to add exp of ['finish'] as well
+        #NOTE(prkriley): problem? ['finish'] is from logsoftmax over positions, and it's logp of inserting at the end, BUT is_terminated is calculated if sampled TOKEN was the EOS token.
+        #NOTE(prkriley): so, training model to just directly predict termination if it sampled the EOS token
+        #NOTE(prkriley): at test time (or at least during beam search) inserting EOS token is not allowed
+        #NOTE(prkriley): is_terminated means EOS token was chosen; need to determine when this isn't masked; does it mean that whole thing is done, or just that nothing should be inserted at THAT position?
+        #NOTE(prkriley): looks like EOS token only choose-able if everything is done, so Q is 1 when is_terminated, and calculation for P is good as well
+        #NOTE(prkriley): when not terminated, terminating is incorrect anyway so excluded from Q
+        #NOTE(prkriley): new recap: self.chosen_insert_logprobs is always log_P, even when termination chosen, and self.logp_any_ref is always log(P/Q), even when terminating
 
         logp_any_ref = tf.reduce_logsumexp(logprobs_flat, axis=-1)  # [batch_size]
         self.logp_any_ref = tf.where(is_terminated, action_logp['finish'], logp_any_ref)
@@ -211,6 +229,9 @@ class SampleReferenceInserts:
         :param sess: tf session to use. tf.get_default_session by default, create new if no default.
         :return: a sequence of dicts {inp_line, hypo, out_to_inp_index, ref_inserts, chosen_inserts, ...}
         """
+        #NOTE(prkriley): however many TOTAL TIMES we get something from the yield from, that's how long the downstream lists (and batch sizes) are!
+        #NOTE(prkriley): answer: goes through each batch entry for 1 timestep, prunes terminated ones, and continues with the next timestep of unterminated ones
+        #NOTE(prkriley): this results in an unfortunate situation where the downstream lists have semi-random subsets corresponding to the same batch item, so accumulation will be non-trivial
         sess = sess or tf.get_default_session() or tf.InteractiveSession()
         inp_lines, ref_lines = zip(*batch)
         hypos_tok = [list() for _ in ref_lines]
@@ -219,15 +240,29 @@ class SampleReferenceInserts:
         hypos_to_indices = list(range(len(inp_lines)))
         # ^-- inp_line index for each hypo in hypo_tok. hypos for shorter inp_lines will terminate earlier.
 
+        #NOTE(prkriley): THIS IS THE TIMESTEP CONTROL LOOP. Accumulation of P/Q values needs to happen here somewhere
+        #NOTE(prkriley): probably can't accumulate here, but we yield each logp_any_ref; accumulate at caller/iterator
+        DEBUG_it = -1
+        DEBUG_dump_str = ''
         while len(hypos_tok):
+            DEBUG_it += 1
             # step 1, find all allowed inserts
             ref_inserts = []
             for hypo, ref in zip(hypos_tok, hypos_ref_tok):
                 if hypo == ref:
-                    ref_inserts.append([{self.model.out_voc.EOS} for _ in hypo])
+                    if ref:
+                      ref_inserts.append([{self.model.out_voc.EOS} for _ in hypo])
+                    else:
+                      ref_inserts.append([{self.model.out_voc.EOS}]) #TODO(prkriley): this might break many things
                 else:
-                    ref_inserts.append(get_optimal_inserts(hypo, ref))
+                    try:
+                      ref_inserts.append(get_optimal_inserts(hypo, ref))
+                    except ValueError as e:
+                      print('Dying in iteration {} through generate_trajectories with batch: {}'.format(DEBUG_it, batch), file=sys.stderr)
+                      print('Dump: {}'.format(DEBUG_dump_str), file=sys.stderr)
+                      raise e
 
+            DEBUG_dump_str = ''
             # step 2, run model to choose inserts
             hypo_lines = [' '.join(hypo_tok) for hypo_tok in hypos_tok]
             hypo_inp_lines = [inp_lines[i] for i in hypos_to_indices]
@@ -240,6 +275,7 @@ class SampleReferenceInserts:
             feed['out_to_inp_indices'] = hypos_to_indices
             feed['ref_inserts'] = batch_inserts_to_coo(ref_inserts, self.model.out_voc)
 
+            #NOTE(prkriley): here we get access to P and P/Q (logp_any_ref)
             (chosen_pos, chosen_token_ix), chosen_insert_logp, logp_any_ref = \
                 sess.run((self.chosen_inserts, self.chosen_insert_logprobs, self.logp_any_ref),
                          {self.batch_ph[k]: feed[k] for k in feed})
@@ -251,6 +287,9 @@ class SampleReferenceInserts:
                 oh_chosen[pos].add(self.model.out_voc.words(token_ix))
                 chosen_inserts.append(oh_chosen)
 
+            DEBUG_dump_str += 'chosen_inserts: {}\n'.format(chosen_inserts)
+
+            #NOTE(prkriley): yields entire batch progressed by one timestep, one batch element at a time
             # step 3, give away results after one step
             yield from [
                 dict(step=len(hypos_tok[0]), inp_line=inp_line, hypo=hypo, ref_inserts=ref_ins,
@@ -276,4 +315,5 @@ class SampleReferenceInserts:
                     new_hypos_indices.append(line_index)
 
             hypos_tok, hypos_ref_tok, hypos_to_indices = new_hypos_tok, new_hypos_ref, new_hypos_indices
+            DEBUG_dump_str += 'hypos_tok: {}\nhypos_ref_tok: {}\nhypos_to_indices:{}\n'.format(hypos_tok, hypos_ref_tok, hypos_to_indices)
 

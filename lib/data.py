@@ -31,6 +31,52 @@ def form_batches(data, batch_size):
             yield batch
 
 
+def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size_max=0):
+    from collections import defaultdict
+    import sys
+    #TODO(prkriley): implement
+    """
+    iterate, bin by id, calculate bin total, perform similar logic to non-grouped but over bins
+    need to figure out field names, and make sure they are real and not Tensors
+    field is: out_to_inp_indices, it's one number (name because grouped later), not Tensor
+    """
+    #bin by index
+    bins = defaultdict(list)
+    max_lens = defaultdict(int)
+    for item in data:
+      idx = item['out_to_inp_indices']
+      bins[idx].append(item)
+      max_lens[idx] = max(max_lens[idx], cost_func(item))
+    
+    slices = []
+    this_slice = []
+    max_len = 0
+    total_len = 0
+    for idx, items in bins.items():
+      max_len = max(max_len, max_lens[idx])
+      if (total_len + len(items)) * max_len > batch_cost or (batch_size_max and (total_len + len(items)) > batch_size_max):
+        if not this_slice:
+          print('Warning: Single hypothesis sequence too big for requested slice size! Skipping (TODO: truncate)', file=sys.stderr)
+          #slices.append([idx])
+          max_len = 0
+          total_len = 0
+        else:
+          slices.append(this_slice)
+          this_slice = [idx]
+          max_len = max_lens[idx]
+          total_len = len(items)
+      else:
+        this_slice.append(idx)
+        total_len += len(items)
+    #end for
+    slices.append(this_slice)
+    for indices in slices:
+      s = []
+      for idx in indices:
+        s += bins[idx]
+      yield s
+
+
 def form_adaptive_batches(data, batch_cost, cost_func=maxlen, batch_size_max=0):
     seq = iter(data)
     prev = []
