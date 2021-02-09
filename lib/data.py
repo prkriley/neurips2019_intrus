@@ -41,12 +41,36 @@ def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size
     field is: out_to_inp_indices, it's one number (name because grouped later), not Tensor
     """
     #bin by index
+    import math
     bins = defaultdict(list)
     max_lens = defaultdict(int)
     for item in data:
       idx = item['out_to_inp_indices']
-      bins[idx].append(item)
-      max_lens[idx] = max(max_lens[idx], cost_func(item))
+      if not batch_size_max or len(bins[idx]) < batch_size_max:
+        bins[idx].append(item)
+        max_lens[idx] = max(max_lens[idx], cost_func(item))
+      elif batch_size_max:
+        print('Warning: Single hypothesis sequence longer than specified max size of {}! Truncating.'.format(batch_size_max), file=sys.stderr)
+
+    #truncation
+    for idx in list(bins.keys()):
+      if len(bins[idx]) * max_lens[idx] > batch_cost:
+        cummaxes = [0]
+        cummax = 0
+        for e in bins[idx]:
+          cummax = max(cummax, cost_func(e))
+          cummaxes.append(cummax)
+        trunc_costs = [i*cummaxes[i] for i in range(len(bins[idx]) + 1)]
+        trunc_idx = len(trunc_costs) - 1
+        while trunc_idx > 0 and trunc_costs[trunc_idx] > batch_cost:
+          trunc_idx -= 1
+        if trunc_idx > 0:
+          bins[idx] = bins[idx][:trunc_idx]
+          max_lens[idx] = cummaxes[trunc_idx]
+        else:
+          del bins[idx]
+
+
     
     slices = []
     this_slice = []
@@ -55,25 +79,27 @@ def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size
     for idx, items in bins.items():
       max_len = max(max_len, max_lens[idx])
       if (total_len + len(items)) * max_len > batch_cost or (batch_size_max and (total_len + len(items)) > batch_size_max):
-        if not this_slice:
-          print('Warning: Single hypothesis sequence too big for requested slice size! Skipping (TODO: truncate)', file=sys.stderr)
-          #slices.append([idx])
-          max_len = 0
-          total_len = 0
-        else:
-          slices.append(this_slice)
-          this_slice = [idx]
-          max_len = max_lens[idx]
-          total_len = len(items)
+        #TODO(prkriley): this only fixes if the FIRST few slices are too big; after a fitting one, we blindly add the next
+        #TODO(prkriley): just truncate all bins first, then do normal logic
+        assert len(this_slice) > 0, 'Bug in truncation code; first truncated hypothesis still too big! len {}, max_len {}.'.format(len(items),max_len)
+        slices.append(this_slice)
+        this_slice = [idx]
+        max_len = max_lens[idx]
+        total_len = len(items)
       else:
         this_slice.append(idx)
         total_len += len(items)
     #end for
     slices.append(this_slice)
     for indices in slices:
+      slice_len = 0
+      slice_max_len = 0
       s = []
       for idx in indices:
         s += bins[idx]
+        slice_max_len = max(slice_max_len, max_lens[idx])
+        slice_len += len(bins[idx])
+      print('Slice len, max_len, total_cost: {}, {}, {}'.format(slice_len, slice_max_len, slice_len*slice_max_len))
       yield s
 
 

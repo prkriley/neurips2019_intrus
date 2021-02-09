@@ -253,6 +253,7 @@ class SampleReferenceInserts:
                     if ref:
                       ref_inserts.append([{self.model.out_voc.EOS} for _ in hypo])
                     else:
+                      print('Found empty reference, which should not happen with filtered data', file=sys.stderr)
                       ref_inserts.append([{self.model.out_voc.EOS}]) #TODO(prkriley): this might break many things
                 else:
                     try:
