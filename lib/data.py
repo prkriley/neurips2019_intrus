@@ -79,8 +79,6 @@ def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size
     for idx, items in bins.items():
       max_len = max(max_len, max_lens[idx])
       if (total_len + len(items)) * max_len > batch_cost or (batch_size_max and (total_len + len(items)) > batch_size_max):
-        #TODO(prkriley): this only fixes if the FIRST few slices are too big; after a fitting one, we blindly add the next
-        #TODO(prkriley): just truncate all bins first, then do normal logic
         assert len(this_slice) > 0, 'Bug in truncation code; first truncated hypothesis still too big! len {}, max_len {}.'.format(len(items),max_len)
         slices.append(this_slice)
         this_slice = [idx]
