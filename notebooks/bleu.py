@@ -13,7 +13,7 @@ def main():
           hyp, ref = line.split('\t')
           print(hyp.strip(), file=h)
           print(ref.strip(), file=r)
-  result = sp.check_output(['sacrebleu', '.ref.tmp', '--input', '.hyp.tmp'])
+  result = sp.check_output(['sacrebleu', '-lc', '.ref.tmp', '--input', '.hyp.tmp'])
   print(result)
 
 if __name__ == '__main__':
