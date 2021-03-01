@@ -44,8 +44,8 @@ from prefetch_generator import background
 from lib.data import form_batches, form_adaptive_batches_windowed, filter_by_len, cycle_shuffle, maxlen
 
 class train:
-    inp_lines = list(open('../data/training/train.en{}.tok.bpe'.format(DATA)))
-    out_lines = list(open('../data/training/train.ru{}.tok.bpe'.format(DATA)))
+    inp_lines = list(open('../data/training/train.en{}.tok.bpe.filter'.format(DATA)))
+    out_lines = list(open('../data/training/train.ru{}.tok.bpe.filter'.format(DATA)))
     #inp_lines = list(open('../data/wmt_enru/train.en'))
     #out_lines = list(open('../data/wmt_enru/train.ru'))
     
@@ -204,7 +204,7 @@ for t in trange(50000):
         dev_bleu_history.append([len(loss_history), dev_bleu_t])
         writer.add_scalar('dev_BLEU', dev_bleu_t, global_step=step)
     
-    if step % 1000 == 0:
+    if step % 2000 == 0:
         save(os.path.join(experiment_name, 'checkpoint_%i.npz' % step),
              tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES))
         
@@ -233,6 +233,10 @@ for t in trange(50000):
 
 # In[ ]:
 
+
+save(os.path.join(experiment_name, 'checkpoint_final.npz'), tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES))
+inp_voc.save('./{}/inp.voc'.format(experiment_name))
+out_voc.save('./{}/out.voc'.format(experiment_name))
 
 from subword_nmt.apply_bpe import BPE
 with open('../data/training/train.en.tok.codes', 'r') as f:

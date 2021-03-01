@@ -31,41 +31,44 @@ def form_batches(data, batch_size):
             yield batch
 
 
-def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size_max=0):
+def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size_max=0, num_samples=1):
     from collections import defaultdict
     import sys
-    #TODO(prkriley): implement
     """
     iterate, bin by id, calculate bin total, perform similar logic to non-grouped but over bins
     need to figure out field names, and make sure they are real and not Tensors
     field is: out_to_inp_indices, it's one number (name because grouped later), not Tensor
     """
+    #TODO(prkriley): sample bookkeeping; field is 'sample_indices'; interleave then trunc as normal
+    #TODO(prkriley): figure out how to do correct segment sums with both enc and sample ids
     #bin by index
     import math
-    bins = defaultdict(list)
+    bins = defaultdict(lambda: [[] for _ in range(num_samples)])
     max_lens = defaultdict(int)
     for item in data:
       idx = item['out_to_inp_indices']
-      if not batch_size_max or len(bins[idx]) < batch_size_max:
-        bins[idx].append(item)
+      sample_idx = item['sample_indices']
+      if not batch_size_max or len(bins[idx][sample_idx]) < batch_size_max:
+        bins[idx][sample_idx].append(item)
         max_lens[idx] = max(max_lens[idx], cost_func(item))
       elif batch_size_max:
         print('Warning: Single hypothesis sequence longer than specified max size of {}! Truncating.'.format(batch_size_max), file=sys.stderr)
 
     #truncation
     for idx in list(bins.keys()):
-      if len(bins[idx]) * max_lens[idx] > batch_cost:
+      if len(bins[idx][0]) * max_lens[idx] * num_samples > batch_cost:
         cummaxes = [0]
         cummax = 0
-        for e in bins[idx]:
+        for e in bins[idx][0]:
           cummax = max(cummax, cost_func(e))
           cummaxes.append(cummax)
-        trunc_costs = [i*cummaxes[i] for i in range(len(bins[idx]) + 1)]
+        trunc_costs = [num_samples*i*cummaxes[i] for i in range(len(bins[idx][0]) + 1)]
         trunc_idx = len(trunc_costs) - 1
         while trunc_idx > 0 and trunc_costs[trunc_idx] > batch_cost:
           trunc_idx -= 1
         if trunc_idx > 0:
-          bins[idx] = bins[idx][:trunc_idx]
+          for i in range(num_samples):
+            bins[idx][i] = bins[idx][i][:trunc_idx]
           max_lens[idx] = cummaxes[trunc_idx]
         else:
           del bins[idx]
@@ -76,17 +79,18 @@ def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size
     this_slice = []
     max_len = 0
     total_len = 0
-    for idx, items in bins.items():
+    for idx, sample_items in sorted(bins.items()):
       max_len = max(max_len, max_lens[idx])
-      if (total_len + len(items)) * max_len > batch_cost or (batch_size_max and (total_len + len(items)) > batch_size_max):
+      items_len = sum([len(items) for items in sample_items])
+      if (total_len + items_len) * max_len > batch_cost or (batch_size_max and (total_len + len(items)) > batch_size_max):
         assert len(this_slice) > 0, 'Bug in truncation code; first truncated hypothesis still too big! len {}, max_len {}.'.format(len(items),max_len)
         slices.append(this_slice)
         this_slice = [idx]
         max_len = max_lens[idx]
-        total_len = len(items)
+        total_len = items_len
       else:
         this_slice.append(idx)
-        total_len += len(items)
+        total_len += items_len
     #end for
     slices.append(this_slice)
     for indices in slices:
@@ -94,10 +98,20 @@ def form_adaptive_batches_grouped(data, batch_cost, cost_func=maxlen, batch_size
       slice_max_len = 0
       s = []
       for idx in indices:
-        s += bins[idx]
+        s += [item for sample_items in bins[idx] for item in sample_items]
         slice_max_len = max(slice_max_len, max_lens[idx])
-        slice_len += len(bins[idx])
-      print('Slice len, max_len, total_cost: {}, {}, {}'.format(slice_len, slice_max_len, slice_len*slice_max_len))
+        slice_len += len(bins[idx][0]*num_samples)
+
+      sample_idx_map = defaultdict(dict)
+      next_id = 0
+      for e in sorted(s, key=lambda elem: (elem['out_to_inp_indices'],elem['sample_indices'])):
+        sample_idx = e['sample_indices']
+        enc_idx = e['out_to_inp_indices']
+        if sample_idx not in sample_idx_map[enc_idx]:
+          sample_idx_map[enc_idx][sample_idx] = next_id
+          next_id += 1
+        e['sample_indices'] = sample_idx_map[enc_idx][sample_idx]
+      #print('Slice len, max_len, total_cost: {}, {}, {}'.format(slice_len, slice_max_len, slice_len*slice_max_len))
       yield s
 
 

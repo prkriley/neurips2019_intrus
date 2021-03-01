@@ -110,15 +110,20 @@ class Transformer:
 
             out_padded = tf.concat([tf.zeros_like(out[:, :1]), out], axis=1)  # [batch_size, nout+1]
             dec_emb = self.emb_out(out_padded, offset='random' if self.dst_rand_offset else 0)
-            # ^-- shape: [batch_size, nout + 1]
+            # ^-- shape: [batch_size, nout + 1] #NOTE(prkriley): this may not be the right shape; surely there's a d_emb dim?; shoud be batch * ninp * emb_dim, where nimp is nout+1
+            #NOTE(prkriley): emb_out's call method calls ops.make_transformer_timing_signal which will have to change with relative encodings
 
             # run decoder
+            #NOTE(prkriley): this mask is encoder-like, with no lokahead masking. If you do the refactor with positional encodings, likely will need to change this to have that masking, and to repack the batches differently
+            #NOTE(prkriley): second-to-last dimension is num_queries, which is 1 for baseline but would be something like nout with the change
+
             attn_mask = ops.make_attn_mask(out_padded, out_len + 1)  # [batch_size, 1, 1, nout + 1]
+            #NOTE(prkriley): n_q is nout+1, inp_dim is emb_dim, n_kv is nout+1, output_depth is hid_size
             dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
                                       enc_out=enc['out'], enc_attn_mask=enc['attn_mask'])
             # ^-- [batch_size, nout + 1, hid_size]
 
-            logits = self.logits(dec_out)  # [batch_size, nout + 1, voc_size + 1]
+            logits = self.logits(dec_out)  # [batch_size, nout + 1, voc_size + 1] #NOTE(prkriley): for refactor, likely need another nout dimension (maybe + 1?) which conceptually is the timestep dim
             if temperature is not None:
                 logits /= temperature
 

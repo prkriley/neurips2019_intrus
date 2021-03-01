@@ -22,13 +22,17 @@ tf.reset_default_graph()
 sess = tf.InteractiveSession()
 
 DATA = "" #or _toy
-experiment_name = "enru_pq_train_debug" #NOTE(prkriley): includes change to replace ref_inserts for empty ref with single EOS insert and dropping seqs too long for one slice
+STEP_K=20
+CHECKPOINT_INTERVAL=5000
+NUM_SAMPLES=5
+experiment_name = "enru_pq_train_{}k_norm_{}samp_v1".format(STEP_K,NUM_SAMPLES) #NOTE(prkriley): includes change to replace ref_inserts for empty ref with single EOS insert and dropping seqs too long for one slice
 #experiment_name = "enru_train_v1_debug"
 # !rm -rf {experiment_name}
 assert not os.path.exists(experiment_name), "please use unique name for each experiment"
 
 BATCH_SIZE=256
 #BATCH_SIZE=8
+SLICE_MAX_LEN=4096
 
 # ### Data preprocessing
 
@@ -39,8 +43,8 @@ from prefetch_generator import background
 from lib.data import form_batches, form_adaptive_batches_windowed, filter_by_len, cycle_shuffle, maxlen
 
 class train:
-    inp_lines = list(open('../data/training/train.en{}.tok.bpe'.format(DATA)))
-    out_lines = list(open('../data/training/train.ru{}.tok.bpe'.format(DATA)))
+    inp_lines = list(open('../data/training/train.en{}.tok.bpe.filter'.format(DATA)))
+    out_lines = list(open('../data/training/train.ru{}.tok.bpe.filter'.format(DATA)))
     #inp_lines = list(open('../data/wmt_enru/train.en'))
     #out_lines = list(open('../data/wmt_enru/train.ru'))
     
@@ -153,7 +157,7 @@ max(hypo_scores.keys(), key=hypo_scores.get)
 from lib.trainer import SampleBasedTrainer
 from lib.util import initialize_uninitialized_variables
 
-trainer = SampleBasedTrainer(model, optimizer_opts=dict(base_lr=1e-4, warmup_time=4000), loss_use_PQ=False) #TODO(prkriley): add loss_use_PQ=True
+trainer = SampleBasedTrainer(model, optimizer_opts=dict(base_lr=1e-4, warmup_time=4000), loss_use_PQ=True)
 initialize_uninitialized_variables()
 
 
@@ -178,9 +182,9 @@ from tqdm import trange
 
 #for t in trange(100000):
 #for t in trange(50000):
-for t in trange(100):
+for t in trange(int(STEP_K*1000)):
     batch = next(train.batcher)
-    metrics_t = trainer.train_on_batch(batch, slice_max_len=4096, grouped=True)
+    metrics_t = trainer.train_on_batch(batch, slice_max_len=SLICE_MAX_LEN, grouped=True, num_samples=NUM_SAMPLES)
     step = metrics_t['step']
     
     for key in metrics_t:
@@ -188,8 +192,8 @@ for t in trange(100):
     loss_history.append(metrics_t['loss'])
     acc_history.append(metrics_t['acc'])
     
-    if step % 100 == 0:
-        if step % 2000 == 0:
+    if step % 100 == 0 or step % CHECKPOINT_INTERVAL == 0:
+        if step % 2000 == 0 or step % CHECKPOINT_INTERVAL == 0:
           log_f = open('{}/step_{}.hypref'.format(experiment_name, step), 'w')
         else:
           log_f = None
@@ -197,7 +201,7 @@ for t in trange(100):
         dev_bleu_history.append([len(loss_history), dev_bleu_t])
         writer.add_scalar('dev_BLEU', dev_bleu_t, global_step=step)
     
-    if step % 1000 == 0:
+    if step % CHECKPOINT_INTERVAL == 0:
         save(os.path.join(experiment_name, 'checkpoint_%i.npz' % step),
              tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES))
         
@@ -226,6 +230,9 @@ for t in trange(100):
 
 # In[ ]:
 
+save(os.path.join(experiment_name, 'checkpoint_final.npz'), tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES))
+inp_voc.save('./{}/inp.voc'.format(experiment_name))
+out_voc.save('./{}/out.voc'.format(experiment_name))
 
 from subword_nmt.apply_bpe import BPE
 with open('../data/training/train.en.tok.codes', 'r') as f:

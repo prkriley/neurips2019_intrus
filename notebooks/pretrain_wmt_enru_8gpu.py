@@ -29,8 +29,8 @@ from lib.data import form_batches, form_adaptive_batches_windowed, filter_by_len
 from lib.multi_gpu import ParallelBatchIterator
 
 class train:
-    inp_lines = list(open('../data/training/train.en{}.tok.bpe'.format(DATA)))
-    out_lines = list(open('../data/training/train.ru{}.tok.bpe'.format(DATA)))
+    inp_lines = list(open('../data/training/train.en{}.tok.bpe.filter'.format(DATA)))
+    out_lines = list(open('../data/training/train.ru{}.tok.bpe.filter'.format(DATA)))
     
     batcher = background(max_prefetch=256)(form_adaptive_batches_windowed)(
         filter_by_len(cycle_shuffle(zip(inp_lines, out_lines)), max_srclen=200, max_dstlen=200),
