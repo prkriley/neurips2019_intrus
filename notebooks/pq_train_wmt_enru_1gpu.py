@@ -21,11 +21,13 @@ import tensorflow as tf
 tf.reset_default_graph()
 sess = tf.InteractiveSession()
 
+RELOAD='./enru_pq_train_20k_norm_5samp_v1/checkpoint_10000.npz'
+#RELOAD='./enru_full_pretrain_v1_100k_L/checkpoint_70000.npz'
 DATA = "" #or _toy
 STEP_K=20
-CHECKPOINT_INTERVAL=5000
-NUM_SAMPLES=5
-experiment_name = "enru_pq_train_{}k_norm_{}samp_v1".format(STEP_K,NUM_SAMPLES) #NOTE(prkriley): includes change to replace ref_inserts for empty ref with single EOS insert and dropping seqs too long for one slice
+CHECKPOINT_INTERVAL=2500
+NUM_SAMPLES=3
+experiment_name = "enru_pq_train_{}k_norm_{}samp_resume10k5samp_v1".format(STEP_K,NUM_SAMPLES) #NOTE(prkriley): includes change to replace ref_inserts for empty ref with single EOS insert and dropping seqs too long for one slice
 #experiment_name = "enru_train_v1_debug"
 # !rm -rf {experiment_name}
 assert not os.path.exists(experiment_name), "please use unique name for each experiment"
@@ -102,7 +104,7 @@ sess.run(tf.global_variables_initializer())
 
 
 from lib.saveload import save, load
-load('./enru_full_pretrain_v1_100k_L/checkpoint_70000.npz', tf.trainable_variables())
+load(RELOAD, tf.trainable_variables())
 #load('./pretrained_model/weights.npz', tf.trainable_variables())
 
 
@@ -200,6 +202,8 @@ for t in trange(int(STEP_K*1000)):
         dev_bleu_t = compute_bleu(next(dev.batcher), log_f=log_f)
         dev_bleu_history.append([len(loss_history), dev_bleu_t])
         writer.add_scalar('dev_BLEU', dev_bleu_t, global_step=step)
+        if log_f:
+          log_f.close()
     
     if step % CHECKPOINT_INTERVAL == 0:
         save(os.path.join(experiment_name, 'checkpoint_%i.npz' % step),
