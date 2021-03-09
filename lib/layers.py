@@ -125,6 +125,7 @@ class TransformerEmbedding:
             if shift_right:
                 emb = tf.pad(emb, [[0, 0], [1, 0], [0, 0]])[:, :-1, :]
 
+            #TODO(prkriley): this has to change with refactor
             return emb + ops.make_transformer_timing_signal(emb, offset=offset)
 
 

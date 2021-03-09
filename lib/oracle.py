@@ -105,8 +105,9 @@ def batch_inserts_to_coo(batch_inserts, voc, dtype=np.int64):
     :rtype: np.ndarray
     """
     return np.asarray([
-        (batch_i, pos_i, token_i)
-        for batch_i, inserts_i in enumerate(batch_inserts)
+        (batch_i, timestep_i, pos_i, token_i)
+        for batch_i, timesteps_i in enumerate(batch_inserts)
+        for timestep_i, inserts_i in enumerate(timesteps_i)
         for pos_i, insert_tokens in enumerate(inserts_i)
         for token_i in sorted(voc.ids(tok) for tok in insert_tokens)
     ], dtype=dtype)
@@ -120,7 +121,9 @@ def inserts_coo_to_tensor(inserts_coo, hypo_shape, voc_size, dtype=tf.bool, spar
     :param voc_size: number of tokens in insert (out) vocabulary
     :returns: tf tensor of shape [batch_size, max_len, voc_size]
     """
-    ref_shape = tf.stack([hypo_shape[0], hypo_shape[1], voc_size])
+    #ref_shape = tf.stack([hypo_shape[0], hypo_shape[1], voc_size])
+    #NOTE(prkriley): need to add timestep dimension, which is same as ref_length which is hypo_shape[1] (maybe +/- 1, verify)
+    ref_shape = tf.stack([hypo_shape[0], hypo_shape[1], hypo_shape[1], voc_size])
     inserts_tensor = tf.SparseTensor(
         inserts_coo,
         tf.ones(tf.shape(inserts_coo)[:1], dtype=dtype),
@@ -161,7 +164,7 @@ class GenerateReferenceInserts:
             raise NotImplementedError("Unsupported mode: " + self.mode)
 
 
-    def generate_trajectories(self, batch, *args, **kwargs):
+    def generate_trajectories(self, batch, *args, truncate_to=None, **kwargs):
         """
         Samples trajectories that start at empty hypothesis and end on reference lines
         :param batch: a sequence of pairs[(inp_line, ref_out_line)]
@@ -170,17 +173,33 @@ class GenerateReferenceInserts:
         inp_lines, ref_lines = zip(*batch)
         out_voc = self.voc
         hypos_ref_tok = [out_voc.words(out_voc.ids(ref_line.split())) for ref_line in ref_lines]
+        if truncate_to:
+            hypos_ref_tok = [hrf[:truncate_to] for hrf in hypos_ref_tok]
 
         for i, (inp_line, ref_tok) in enumerate(zip(inp_lines, hypos_ref_tok)):
             trajectory = list(generate_insert_trajectory(ref_tok, choice=self.choose_insert))
+            #TODO(prkriley): right here we can collect these timesteps into 1
             if self.samples_per_line is not None:
+                raise NotImplementedError
                 trajectory = random.sample(trajectory, k=min(len(trajectory), self.samples_per_line))
+            #TODO(prkriley): reorder hypo to be actual generation order
+            print("WARNING: reorder hypo!")
+            yield_dict = dict(hypo=' '.join(ref_tok), inp_line=inp_line, out_to_inp_indices=i, ref_inserts=[], chosen_inserts=[])
             for hypo, inserts, chosen in trajectory:
                 if chosen is None:  # nothing to insert
                     inserts = [{out_voc.EOS} for _ in inserts]
                     chosen = (random.randint(0, len(inserts)), out_voc.EOS)
                 chosen = [{chosen[1]} if i == chosen[0] else set() for i in range(len(inserts))]
+                yield_dict['ref_inserts'].append(inserts)
+                yield_dict['chosen_inserts'].append(chosen)
 
-                yield dict(step=len(hypo), inp_line=inp_line, hypo=' '.join(hypo), ref_inserts=inserts,
-                           chosen_inserts=chosen, out_to_inp_indices=i)
+                #TODO(prkriley): hypo could probably be repurposed as chosen_inserts, just with tokens in production order; ref_inserts will have to be 2D (list of list?), just enumeration of sublists existing now
+                  #current fields: step, inp_line, hypo, ref_inserts, chosen_inserts, out_to_inp_indices
+                  #remove: step, hypo
+                  #modify: ref_inserts, chosen_inserts
+                    #ref_inserts: concat into 2D
+                    #chosen_inserts: concat into 2D (will be post-processed later)
+                #yield dict(step=len(hypo), inp_line=inp_line, hypo=' '.join(hypo), ref_inserts=inserts,
+                #           chosen_inserts=chosen, out_to_inp_indices=i)
                 # yeah, select randomly again as we don't care if it's the same
+            yield yield_dict

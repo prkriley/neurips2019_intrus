@@ -109,6 +109,20 @@ def make_attn_mask(inp, inp_len, dtype=tf.float32):
         mask = tf.sequence_mask(inp_len, dtype=dtype, maxlen=tf.shape(inp)[1])
         return mask[:, None, None, :]
 
+def make_causal_attn_mask(inp, inp_len, dtype=tf.float32):
+    """
+    inp: [batch_size, P]
+    inp_len: [batch_size]
+
+    returns: mask, [batch_size, 1, P, P]
+    """
+    P = tf.shape(inp)[1]
+    with tf.name_scope("causal_mask"):
+        causal_mask = tf.sequence_mask(tf.range(P) + 1, dtype=dtype, maxlen=P)[None, :, :] # [1, P, P]
+        len_mask = tf.sequence_mask(inp_len, dtype=dtype, maxlen=P)[:, None, :] # [batch_size, 1, P]
+        return (causal_mask * len_mask)[:, None, :, :] # [batch_size, 1, P, P
+    
+
 
 def infer_length(seq, eos=1):
     """

@@ -43,19 +43,22 @@ class BeamSearchInserts:
 
         # step 2: assemble decoder outputs for each input
         # there may be several out hypos for the same inp line. Up to beam_size hypos to be exact.
-        out_to_inp_ix = tf.zeros([tf.shape(self.batch_ph['out'])[0]], dtype=tf.int64)
+        out_to_inp_ix = tf.zeros([tf.shape(self.batch_ph['out'])[0]], dtype=tf.int64) #NOTE(prkriley): zeros because 1 input
         enc_reordered = {k: tf.gather(v, out_to_inp_ix) for k, v in self.cached_enc_state.items()}
 
         # step 3: compute logits and action log-probs for inserting tokens and finishing
-        logp = model.compute_action_logprobs(self.batch_ph, is_train, enc=enc_reordered)
+        logp = model.compute_action_logprobs(self.batch_ph, is_train, enc=enc_reordered, debug_inference=True)
 
         ###################
         # insert operation
-        hypo_logprobs_insert = self.hypo_base_logprobs[:, None, None] + logp['insert']
+        #TODO(prkriley): I think the solution is to always look at the last timestep
+        #TODO(prkriley): consider an inference-only compute_action_logprobs that only calcs for last timestep
+        hypo_logprobs_insert = self.hypo_base_logprobs[:, None, None] + logp['insert'][:,-1,:,:]
         # ^-- [batch, position, token]
         hypo_logprobs_insert -= 1e9 * tf.to_float(tf.logical_not(self.allowed_tokens))
         best_inserts_flat = tf.nn.top_k(tf.reshape(hypo_logprobs_insert, [-1]), k=self.k_best, sorted=True)
 
+        #TODO(prkriley): verify that ['out'] is used properly; we changed it to always be the ref
         batch_size, max_len = tf.shape(self.batch_ph['out'])[0], tf.shape(self.batch_ph['out'])[1]
         voc_size = len(model.out_voc)
 
@@ -67,7 +70,9 @@ class BeamSearchInserts:
 
         ##################
         # eos operation
-        self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish']
+        print('WARNING: Double-check inference!')
+        self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish'][:, -1]
+        #TODO(prkriley): maybe doing -1 is wrong? does it depend on how long that sequence actually was?
 
     def translate_line(self, src, beam_size=32, max_steps=None, beam_spread=float('inf'),
                        sess=None, verbose=False, eos_in_beam=True):
@@ -87,6 +92,9 @@ class BeamSearchInserts:
         sess = sess or tf.get_default_session() or tf.InteractiveSession()
         finished_translation_logp = {}    # {dst -> logp(reach this hypo)}, used for pruning with beam spread
         best_finished_logp = -float('inf')
+        #TODO(prkriley): fix hypo_base_logprobs shape; was [batch], should probably be [batch, T] now? need to think about this
+            #aligning dims indicates it is needed, but unclear if we really need all T steps at once in beam search
+            #NOTE that this class is only used to actually decode; not really in training (though used for dev performance)
         beam, beam_logp = [''], [0.0]
 
         # save encoder state to tf variables
@@ -167,7 +175,7 @@ class SampleReferenceInserts:
         self.model = model
         self.batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample()))
         self.batch_ph['out_to_inp_indices'] = tf.placeholder('int64', [None])  # [batch_size]
-        self.batch_ph['ref_inserts'] = tf.placeholder('int64', [None, 3])
+        self.batch_ph['ref_inserts'] = tf.placeholder('int64', [None, 4])
 
         # step 1: precomputed encoder outputs for all unique input lines
         self.cached_enc_state = enc_state
@@ -178,30 +186,33 @@ class SampleReferenceInserts:
 
         is_ref_insert = inserts_coo_to_tensor(self.batch_ph['ref_inserts'],
                                                   tf.shape(self.batch_ph['out']), len(model.out_voc))
-        # ^-- [batch, time, voc_size]
+        # ^-- [batch, T, nout, voc_size]
 
         masked_logprobs = tf.where(is_ref_insert,
                                    action_logp['insert'],
                                    tf.fill(tf.shape(action_logp['insert']), -float('inf')))
 
-        logprobs_flat = tf.reshape(masked_logprobs, [tf.shape(action_logp['insert'])[0], -1])  # [batch, time*voc_size]
+        #TODO(prkriley): redo with additional T (= nout) dimension
+        batch_size = tf.cast(tf.shape(action_logp['insert'])[0], tf.int64)
+        T = tf.cast(tf.shape(action_logp['insert'])[1], tf.int64)
+        logprobs_flat = tf.reshape(masked_logprobs, [batch_size*T, -1])  # [batch*T, nout*voc_size]
         #TODO(prkriley): compute renormalization to get Q values
         #NOTE(prkriley): ['insert'] is [batch, time, voc_size]; for each batch entry, item [t][v] is log_prob of inserting vocab item v at position t which is logp(t) + logp(v|t) = log(p(t) * p(v|t))
         #NOTE(prkriley): I think we can use logsumexp to determine the new normalization to get Q (or log Q)
         #NOTE(prkriley): That is exactly what logp_any_ref is
 
         if greedy:
-            chosen_index_flat = tf.argmax(logprobs_flat, axis=1)
+            chosen_index_flat = tf.reshape(tf.argmax(logprobs_flat, axis=-1), [batch_size, T])
         else:
-            chosen_index_flat = tf.multinomial(logprobs_flat, num_samples=1)[:, 0]
+            chosen_index_flat = tf.reshape(tf.multinomial(logprobs_flat, num_samples=1)[:, 0], [batch_size, T])
 
-        chosen_pos = chosen_index_flat // len(model.out_voc)
-        chosen_token_ix = chosen_index_flat % len(model.out_voc)
+        chosen_pos = chosen_index_flat // len(model.out_voc) # [batch_size, T]
+        chosen_token_ix = chosen_index_flat % len(model.out_voc) # [batch_size, T]
         self.chosen_inserts = [chosen_pos, chosen_token_ix]
-        chosen_insert_logprobs = tf.gather_nd(logprobs_flat, tf.stack(
-            [tf.range(0, tf.to_int64(tf.shape(chosen_index_flat)[0]), dtype=chosen_index_flat.dtype),
-             chosen_index_flat], axis=-1)
-        )
+        #chosen_insert_logp_indices = tf.stack([tf.range(batch_size, dtype=chosen_index_flat.dtype)[:, None], tf.range(T, dtype=chosen_index_flat.dtype)[None, :], chosen_index_flat], axis=-1)
+        chosen_insert_logp_indices = tf.stack([tf.range(batch_size)[:, None], tf.range(T)[None, :], chosen_index_flat], axis=-1)
+        logprobs_flat = tf.reshape(logprobs_flat, [batch_size, T, -1])
+        chosen_insert_logprobs = tf.gather_nd(logprobs_flat, chosen_insert_logp_indices) # [batch_size, T]
 
         is_terminated = tf.equal(chosen_token_ix, model.out_voc.eos)
         self.chosen_insert_logprobs = tf.where(is_terminated, action_logp['finish'], chosen_insert_logprobs) 
@@ -219,7 +230,7 @@ class SampleReferenceInserts:
         #NOTE(prkriley): when not terminated, terminating is incorrect anyway so excluded from Q
         #NOTE(prkriley): new recap: self.chosen_insert_logprobs is always log_P, even when termination chosen, and self.logp_any_ref is always log(P/Q), even when terminating
 
-        logp_any_ref = tf.reduce_logsumexp(logprobs_flat, axis=-1)  # [batch_size]
+        logp_any_ref = tf.reduce_logsumexp(logprobs_flat, axis=-1)  # [batch_size, T]
         self.logp_any_ref = tf.where(is_terminated, action_logp['finish'], logp_any_ref)
 
     def generate_trajectories(self, batch, sess=None):

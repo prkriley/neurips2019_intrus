@@ -69,8 +69,10 @@ class SampleBasedTrainer:
                 'out_len': tf.placeholder('int32', [None]),
                 'out_to_inp_indices': tf.placeholder('int32', [None]),
                 'ref_len': tf.placeholder('int32', [None]),
-                'ref_inserts': tf.placeholder('int64', [None, 3]),
-                'chosen_inserts': tf.placeholder('int64', [None, 3]),
+                #'ref_inserts': tf.placeholder('int64', [None, 3]),
+                #'chosen_inserts': tf.placeholder('int64', [None, 3]),
+                'ref_inserts': tf.placeholder('int64', [None, 4]),
+                'chosen_inserts': tf.placeholder('int64', [None, 4]),
                 'sample_indices': tf.placeholder('int32', [None]),
                 'sample_to_inp_indices': tf.placeholder('int32', [None]),
             }
@@ -148,7 +150,7 @@ class SampleBasedTrainer:
                 initialize_uninitialized_variables(sess=sess, var_list=remaining_utility_variables)
 
 
-    def train_on_batch(self, batch, slice_max_len=None, optimizer_step=True, reset_counters=None, grouped=False, num_samples=1):
+    def train_on_batch(self, batch, slice_max_len=None, optimizer_step=True, reset_counters=None, grouped=False, num_samples=1, example_trunc_len=None):
         """
         Accumulates gradients and counters,
         :param batch: a list of pairs [(inp_line, out_line), ...]
@@ -174,7 +176,8 @@ class SampleBasedTrainer:
         #samples_to_inp_indices = [-1 for _ in range(num_samples*len(batch))]
         timestamp = time.time()
         for i in range(num_samples):
-          these_trajectories = list(self.path_sampler.generate_trajectories(batch, sess))
+          these_trajectories = list(self.path_sampler.generate_trajectories(batch, sess, truncate_to=example_trunc_len))
+          #print('Trajectories:\n{}'.format(these_trajectories))
           for t in these_trajectories:
             t['sample_indices'] = i
             #t['sample_indices'] = i + t['out_to_inp_indices']*num_samples
@@ -206,11 +209,11 @@ class SampleBasedTrainer:
             if grouped:
                 slices = form_adaptive_batches_grouped(batch_trajectories,
                                                slice_max_len,
-                                               cost_func=lambda row: linelen(row['hypo']), num_samples=num_samples)
+                                               cost_func=lambda row: linelen(row['hypo'])**2, num_samples=num_samples)
             else:
                 slices = form_adaptive_batches(batch_trajectories,
                                                slice_max_len,
-                                               cost_func=lambda row: linelen(row['hypo']))
+                                               cost_func=lambda row: linelen(row['hypo'])**2)
         #print("Slicing time: {}".format(time.time() - timestamp))
 
         # 3.2 process hypos one slice at a time
@@ -218,8 +221,8 @@ class SampleBasedTrainer:
 
             slice_feed = {key: [row[key] for row in slice] for key in slice[0].keys()}
 
-            slice_feed['out_len'] = [linelen(hypo) for hypo in slice_feed['hypo']]
-            slice_feed['out'] = model.out_voc.to_matrix(slice_feed.pop('hypo'))
+            slice_feed['out_len'] = [linelen(hypo) for hypo in slice_feed['hypo']] #TODO(prkriley):modify; actually just use ref_len instead
+            slice_feed['out'] = model.out_voc.to_matrix(slice_feed.pop('hypo')) #TODO(prkriley):modify
             slice_feed['ref_inserts'] = batch_inserts_to_coo(slice_feed['ref_inserts'], model.out_voc)
             slice_feed['chosen_inserts'] = batch_inserts_to_coo(slice_feed['chosen_inserts'], model.out_voc)
             slice_feed['ref_len'] = [reference_lengths[i] for i in slice_feed['out_to_inp_indices']]
@@ -277,8 +280,8 @@ class SampleBasedTrainer:
         #NOTE(prkriley): something about train vs. inference? doesn't make sense
         #NOTE(prkriley): constructor for SampleReferenceInserts calls compute_action_logprobs but doesn't use it, so likely TF-lazy
         logp = self.model.compute_action_logprobs(batch_ph, is_train=is_train, enc=enc_reordered)
-        insert_logprobas = logp['insert']  # [batch, nout, voc_size]
-        finish_logprobas = logp['finish']  # [batch]
+        insert_logprobas = logp['insert']  # [batch, T, nout, voc_size] (T = nout)
+        finish_logprobas = logp['finish']  # [batch, T]
 
         # get reference inserts
         is_ref_insert = inserts_coo_to_tensor(batch_ph['ref_inserts'],
@@ -467,13 +470,13 @@ class FixedOrderTrainer(SampleBasedTrainer):
                              for k, v in cached_enc_state.items()}
 
         logp = self.model.compute_action_logprobs(batch_ph, is_train=is_train, enc=enc_reordered)
-        insert_logprobas = logp['insert']  # [batch]
-        finish_logprobas = logp['finish']  # [batch, nout, voc_size]
+        insert_logprobas = logp['insert']  # [batch, T, nout, voc_size]
+        finish_logprobas = logp['finish']  # [batch, T]
 
         # get reference inserts
         is_ref_insert = inserts_coo_to_tensor(batch_ph['ref_inserts'],
                                               tf.shape(batch_ph['out']),
-                                              len(self.model.out_voc))
+                                              len(self.model.out_voc)) # [batch, T, nout, voc_size]
         is_chosen_insert = inserts_coo_to_tensor(batch_ph['chosen_inserts'],
                                                  tf.shape(batch_ph['out']),
                                                  len(self.model.out_voc))
@@ -481,9 +484,10 @@ class FixedOrderTrainer(SampleBasedTrainer):
         mask_correct = is_chosen_insert if loss_use_logp_chosen else is_ref_insert
 
         # assumes that reference inserts for ended hypo are EOS tokens and after-reference are NULL
-        should_finish = tf.reduce_any(is_ref_insert[:, :, self.model.out_voc.eos], axis=-1)
+        should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
 
-        logp_ref = tf.einsum("btl,btl->b", insert_logprobas, tf.to_float(mask_correct))
+        #TODO(prkriley): fix
+        logp_ref = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
         # equivalent to tf.reduce_sum(insert_logprobas * mask_correct, (1, 2)), but without tmp tensor
 
         xent_values = logp_ref / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
@@ -492,7 +496,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
         xent_values = -tf.where(should_finish,
                                 finish_logprobas,
                                 xent_values)
-        # ^-- [batch_size]
+        # ^-- [batch_size, T]
 
         if eos_coeff is None:
             xent_numerator = tf.reduce_sum(xent_values)
@@ -516,9 +520,11 @@ class FixedOrderTrainer(SampleBasedTrainer):
 
         # metrics
         p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref))
-        argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, -1]), axis=-1)
-        is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, -1]),
-                                         tf.stack([tf.range(batch_size), tf.to_int32(argmax_flat)], -1))
+        T = tf.shape(insert_logprobas)[1]
+        argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, T, -1]), axis=-1)
+        #TODO(prkriley): fix
+        is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, T, -1]),
+                tf.stack([tf.broadcast_to(tf.range(batch_size)[:,None], [batch_size, T]), tf.broadcast_to(tf.range(T)[None,:], [batch_size, T]), tf.to_int32(argmax_flat)], -1))
         is_argmax_correct = tf.where(should_finish, tf.exp(finish_logprobas) >= 0.5, is_argmax_correct)
 
 
