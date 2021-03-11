@@ -170,7 +170,7 @@ def initialize_uninitialized_variables(sess=None, var_list=None):
 def get_optimized_variables(model, verbose=True):
     """ returns a list of trainable variables that actually have nonzero gradients """
 
-    batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample()))
+    batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample(), dummy_relative_positions=True))
     logp = model.compute_action_logprobs(batch_ph, is_train=True)
     out = sum(map(tf.reduce_sum, logp.values()))
     all_vars = tf.trainable_variables()

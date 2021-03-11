@@ -134,6 +134,27 @@ def inserts_coo_to_tensor(inserts_coo, hypo_shape, voc_size, dtype=tf.bool, spar
     return inserts_tensor
 
 
+def _map_chosen_to_prod(chosen, prod_order):
+    new_prod_order = prod_order.copy()
+    if chosen is None:
+        i = prod_order[-1]
+        new_prod_order.insert(len(prod_order), len(prod_order))
+    else:
+        i = prod_order[chosen[0]]
+        new_prod_order.insert(chosen[0]+1, len(prod_order))
+    return i, new_prod_order
+
+def extend_relative_positions_matrix(R, prod_order, chosen):
+    #i is production index AFTER which to insert
+    i, new_prod_order = _map_chosen_to_prod(chosen,prod_order)
+    v = R[i].copy()
+    v[v == 1] = 0
+    return np.concatenate([np.concatenate((R,v[None,:]),axis=0), np.concatenate([2-v,[0]], axis=0)[:,None]],axis=1), new_prod_order
+
+def relative_positions_matrix_and_prod_order():
+    return np.array([[0]]), [0]
+
+
 class GenerateReferenceInserts:
     def __init__(self, voc, mode='random', samples_per_line=None, **params):
         """
@@ -182,13 +203,29 @@ class GenerateReferenceInserts:
             if self.samples_per_line is not None:
                 raise NotImplementedError
                 trajectory = random.sample(trajectory, k=min(len(trajectory), self.samples_per_line))
-            #TODO(prkriley): reorder hypo to be actual generation order
-            print("WARNING: reorder hypo!")
-            yield_dict = dict(hypo=' '.join(ref_tok), inp_line=inp_line, out_to_inp_indices=i, ref_inserts=[], chosen_inserts=[])
+            #NOTE: need to also put EOS before generated tokens
+            #TODO(prkriley): reorder hypo to be actual generation order AND calculate matrix R
+                #each chosen is (pos, token)
+                #hypo is just those tokens, in order
+                #have extend_R(R,i) where i is production index of thing to insert before
+                #need to convert the pos's from chosen (which are absolutes) into that
+                #hypo is BEFORE doing the insert, so the index is the thing we want
+                #NOTE that chosen_index works as an insert-before index if there is implicit EOS at first
+                #need to keep track of surface sequence with prod-idx (leave off implicit 0 at beginning)
+                    #[1]; c=0
+                    #[2 1]; c=1
+                    #[2 3 1]
+            yield_dict = dict(inp_line=inp_line, out_to_inp_indices=i, ref_inserts=[], chosen_inserts=[])
+            R, prod_order = relative_positions_matrix_and_prod_order()
+            prod_tokens = []
             for hypo, inserts, chosen in trajectory:
+                R, prod_order = extend_relative_positions_matrix(R, prod_order, chosen)
                 if chosen is None:  # nothing to insert
                     inserts = [{out_voc.EOS} for _ in inserts]
                     chosen = (random.randint(0, len(inserts)), out_voc.EOS)
+                else:
+                    prod_tokens.append(chosen[1])
+                #TODO(prkriley): determine whether we need to do something special when chosen is none for prod_order
                 chosen = [{chosen[1]} if i == chosen[0] else set() for i in range(len(inserts))]
                 yield_dict['ref_inserts'].append(inserts)
                 yield_dict['chosen_inserts'].append(chosen)
@@ -202,4 +239,6 @@ class GenerateReferenceInserts:
                 #yield dict(step=len(hypo), inp_line=inp_line, hypo=' '.join(hypo), ref_inserts=inserts,
                 #           chosen_inserts=chosen, out_to_inp_indices=i)
                 # yeah, select randomly again as we don't care if it's the same
+            yield_dict['hypo'] = ' '.join(prod_tokens)
+            yield_dict['relative_positions'] = R
             yield yield_dict

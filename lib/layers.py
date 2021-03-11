@@ -125,8 +125,27 @@ class TransformerEmbedding:
             if shift_right:
                 emb = tf.pad(emb, [[0, 0], [1, 0], [0, 0]])[:, :-1, :]
 
-            #TODO(prkriley): this has to change with refactor
             return emb + ops.make_transformer_timing_signal(emb, offset=offset)
+
+class TransformerRelativeEmbedding(TransformerEmbedding):
+    def __call__(self, words, shift_right=False, offset=0):
+        with tf.name_scope(self.name):
+            emb = self.emb(words)  # [batch_size * ninp * emb_dim]
+
+            if self.rescale:
+                emb *= self.emb_size ** .5
+
+            if self.bias:
+                emb += self.emb_bias
+
+            if shift_right:
+                emb = tf.pad(emb, [[0, 0], [1, 0], [0, 0]])[:, :-1, :]
+
+            #TODO(prkriley): change timing signal and add supporting args
+            #TODO(prkriley): actually no, just remove the signal here and do it in attention later
+            #return emb + ops.make_transformer_timing_signal(emb, offset=offset)
+            return emb
+
 
 
 class LayerNorm:
@@ -472,7 +491,7 @@ class MultiHeadAttn:
         self.attn_dropout = attn_dropout
         self.attn_value_dropout = attn_value_dropout
         if combine_weight_matrices is None:
-            combine_weight_matrices = kv_inp_size is None
+            combine_weight_matrices = kv_inp_size is None #NOTE(prkriley): True
 
         with tf.variable_scope(name):
             self.scope = tf.get_variable_scope()
@@ -524,11 +543,28 @@ class MultiHeadAttn:
                         bias=tf.concat([self.query_conv.b, self.kv_conv.b], axis=0),
                         )
 
+            self.relative_embeddings = Dense(
+                'rel_emb',
+                3, key_depth,
+                activ=lambda x: x,
+                bias_initializer=tf.zeros_initializer())
+
             self.out_conv = Dense(
                 'out_conv',
                 value_depth, output_depth,
                 activ=lambda x: x,
                 bias_initializer=tf.zeros_initializer())
+
+    @staticmethod
+    def split_heads_r4(x, num_heads):
+        #x: [batch_size, n_q, n_kv, inp_dim]
+        #output: [batch_size, num_heads, n_q, n_kv, inp_dim/num_heads]
+        old_shape = x.get_shape().dims
+        dim_size = old_shape[-1]
+        new_shape = old_shape[:-1] + [num_heads] + [dim_size // num_heads if dim_size else None]
+        ret = tf.reshape(x, tf.concat([tf.shape(x)[:-1], [num_heads, tf.shape(x)[-1] // num_heads]], 0))
+        ret.set_shape(new_shape)
+        return tf.transpose(ret, [0, 3, 1, 2, 4])  # [batch_size * n_heads * ninp * (hid_dim//n_heads)]
 
     @staticmethod
     def split_heads(x, num_heads):
@@ -559,11 +595,12 @@ class MultiHeadAttn:
         ret.set_shape(new_shape)
         return ret
 
-    def __call__(self, query_inp, attn_mask, kv_inp=None, kv=None):
+    def __call__(self, query_inp, attn_mask, kv_inp=None, kv=None, relative_positions=None):
         """
         query_inp: [batch_size * n_q * inp_dim]
         attn_mask: [batch_size * 1 * n_q * n_kv]
         kv_inp: [batch_size * n_kv * inp_dim]
+        relative_positions: [batch_size, n_q, n_kv]
         -----------------------------------------------
         results: [batch_size * n_q * output_depth]
         """
@@ -579,6 +616,8 @@ class MultiHeadAttn:
                                                        " for queries and kv. One must give it kv_inp kwarg (or kv)"
                 combined = self.combined_conv(query_inp)
                 q, k, v = tf.split(combined, [self.key_depth, self.key_depth, self.value_depth], axis=2)
+                
+
             q = self.split_heads(q, self.num_heads)  # [batch_size * n_heads * n_q * (k_dim/n_heads)]
             k = self.split_heads(k, self.num_heads)  # [batch_size * n_heads * n_kv * (k_dim/n_heads)]
             v = self.split_heads(v, self.num_heads)  # [batch_size * n_heads * n_kv * (v_dim/n_heads)]
@@ -586,10 +625,29 @@ class MultiHeadAttn:
             key_depth_per_head = self.key_depth / self.num_heads
             q = q / np.sqrt(key_depth_per_head)
 
-            # Dot-product attention
-            # logits: (batch_size * n_heads * n_q * n_kv)
+            #TODO(prkriley): replace with relative encoding stuff
+                #k: [batch_size, n_kv, k_dim] before split
+                #given R: [batch_size, n_q, n_kv] #n_qk == n_q == n_kv
+                #values in R are ternary, indices into A: [3, k_dim]
+                #self.A: [1,1,3,d]
+                #A = tf.broadcast_to(self.A, tf.concat([tf.shape(R)[:2], tf.shape(self.A)[:-2]], axis=0))
+                #E = tf.batch_gather(A,R): [batch, n_q, n_kv, k_dim]
+                #E = self.split_heads_r4(E): [batch, n_heads, n_q, n_kv, k_dim/n_heads]
+                #KE = k[:, :, None, :, :] + E: [batch, n_heads, n_q, n_kv, kdim/n_heads]
+                #logits = tf.einsum('bhqd,bhqkd->bhqk',q,KE)
+            if relative_positions is not None:
+                A = tf.broadcast_to(self.relative_embeddings.W[None, None, :, :], tf.concat([tf.shape(relative_positions)[:2], tf.shape(self.relative_embeddings.W)], axis=0))
+                E = tf.batch_gather(A,relative_positions) # [batch_size, n_q, n_kv, k_dim]
+                E = self.split_heads_r4(E, self.num_heads)
+                KE = k[:, :, None, :, :] + E
+                logits = tf.einsum('bhqd,bhqkd->bhqk', q, KE)
+            else:
+                # Dot-product attention
+                # logits: (batch_size * n_heads * n_q * n_kv)
+                logits = tf.matmul(q, tf.transpose(k, perm=[0, 1, 3, 2]))
+
             attn_bias = MultiHeadAttn.ATTN_BIAS_VALUE * (1 - attn_mask)
-            logits = tf.matmul(q, tf.transpose(k, perm=[0, 1, 3, 2])) + attn_bias
+            logits += attn_bias
             weights = tf.nn.softmax(logits)
 
             if ops.is_dropout_enabled():
@@ -683,7 +741,7 @@ class TransformerChain(ResidualChain):
             for i in range(num_layers):
                 self.self_attn_layers.append(self.add_layer(
                     attn_layer('attn-%i' % i, first=(i == 0)),
-                    'self_attn_mask'))
+                    'self_attn_mask', relative_positions='relative_positions'))
 
                 for attn_inp in attn_inputs:
                     self.attn_layers[attn_inp].append(self.add_layer(

@@ -41,7 +41,7 @@ class Transformer:
                 'emb_inp', max_voc_size if share_emb else len(inp_voc), emb_size,
                 bias=inp_emb_bias, rescale=rescale_emb, device=emb_inp_device)
 
-            self.emb_out = layers.TransformerEmbedding(
+            self.emb_out = layers.TransformerRelativeEmbedding(
                 'emb_out', max_voc_size if share_emb else len(out_voc), emb_size,
                 matrix=self.emb_inp.emb.mat if share_emb else None,
                 rescale=rescale_emb, device=emb_out_device)
@@ -75,17 +75,36 @@ class Transformer:
             'inp_len': tf.placeholder('int32', [None])
         }
 
-    def make_feed_dict(self, batch, **kwargs):
+    def make_feed_dict(self, batch, dummy_relative_positions=False, relative_positions_matrices=None, **kwargs):
         """ Take input data strings, return a dict { key: np.array(value) } """
         inp_lines, out_lines = zip(*batch)
         inp_len = [linelen(line) for line in inp_lines]
         out_len = [linelen(line) for line in out_lines]
-        return {
+        P = max(out_len) + 1
+        if dummy_relative_positions:
+            #TODO(prkriley): relative_positions has to actually be reasonable, in at least some cases
+            relative_positions = np.ones([len(out_len),P,P],dtype=np.int32) # [batch, P, P]
+            relative_positions[:,0,:] += 1 #not meaningful, just want to give variance to values
+            relative_positions[:,-1,:] -= 1
+        elif relative_positions_matrices is not None:
+            relative_positions = []
+            for i, m in enumerate(relative_positions_matrices):
+                size = out_len[i] + 1
+                assert m.shape == (size, size), "m.shape: {} =/= (size,size): {}".format(m.shape, (size,size))
+                relative_positions.append(np.pad(m, ((0,P-size),(0,P-size))))
+
+            relative_positions = np.stack(relative_positions, axis=0)
+        else:
+            relative_positions = None
+        output = { 
             'inp': self.inp_voc.to_matrix(inp_lines),
             'inp_len': np.array(inp_len, 'int32'),
             'out': self.out_voc.to_matrix(out_lines),
-            'out_len': np.array(out_len, 'int32')
-        }
+            'out_len': np.array(out_len, 'int32'),}
+
+        if relative_positions is not None:
+            output['relative_positions'] = relative_positions
+        return output
 
     def encode(self, batch, is_train):
         """ Take placeholders for data batch, return encoder state """
@@ -93,7 +112,7 @@ class Transformer:
             inp = batch['inp']  # [batch_size * ninp]
             inp_len = batch.get('inp_len', ops.infer_length(inp, self.inp_voc.eos))  # [batch]
             attn_mask = ops.make_attn_mask(inp, inp_len)  # [batch_size, 1, 1, ninp]
-            out, _ = self.encoder(self.emb_inp(inp), self_attn_mask=attn_mask)
+            out, _ = self.encoder(self.emb_inp(inp), self_attn_mask=attn_mask, relative_positions=None)
             # ^-- [batch_size, ninp, hid_size]
             return dict(out=out, attn_mask=attn_mask)
 
@@ -124,14 +143,12 @@ class Transformer:
             #NOTE(prkriley): emb_out's call method calls ops.make_transformer_timing_signal which will have to change with relative encodings
 
             # run decoder
-            #NOTE(prkriley): this mask is encoder-like, with no lookahead masking. If you do the refactor with positional encodings, likely will need to change this to have that masking, and to repack the batches differently
-            #NOTE(prkriley): second-to-last dimension is num_queries, which is 1 for baseline but would be something like nout with the change
 
-            #TODO(prkriley): change this attention mask; note that for now though the dec_out shape should be fine
             attn_mask = ops.make_causal_attn_mask(out_padded, out_len + 1)  # [batch_size, 1, nout + 1, nout + 1]
             #NOTE(prkriley): n_q is nout+1, inp_dim is emb_dim, n_kv is nout+1, output_depth is hid_size
+            #TODO(prkriley): This needs to have the relative encoding stuff
             dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
-                                      enc_out=enc['out'], enc_attn_mask=enc['attn_mask'])
+                                      enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=batch['relative_positions'])
             # ^-- [batch_size, nout + 1, hid_size]
 
 
@@ -156,8 +173,14 @@ class Transformer:
             T = P - 1
             H = dec_out # [batch_size, P, hid_size]
             H_prime = dec_out[:,:-1,:] # [batch_size, T, hid_size] or [batch_size, P-1, hid_size] depending on context
+            if not is_train:
+                H_prime = tf.batch_gather(H_prime, out_len[:, None]) # [batch_size, T=1, hid_size]
             position_selector = self.logits_D(H) # [batch_size, P, hid_size]
             timestep_selector_for_position = self.logits_E(H_prime) # [batch_size, T, hid_size]
+            #TODO(prkriley): instead of -1, need to gather by actual last valid index
+            #if not is_train:
+                #timestep_selector_for_position = tf.batch_gather(timestep_selector_for_position, out_len[:, None]) # [batch_size, T=1, hid_size]
+                #timestep_selector_for_position = timestep_selector_for_position[:,-1:,:] #only care about last timestep in inference
             position_logits = tf.matmul(timestep_selector_for_position, position_selector, transpose_b=True) # [batch_size, T, P]
             #TODO(prkriley): attention mask
             #at max T, same as baseline: extends into P dimension with out_len+1 Trues which is at most nout+1=P
@@ -166,18 +189,26 @@ class Transformer:
             #how to construct? ignoring batch, start with range(P) and range(T)+1, broadcast both, do t >= p, then baseline mask
             #TODO(prkriley): is this actually any different from the causal attn_mask?
             time_position_mask = tf.greater_equal(tf.range(1, T+1)[None, :, None], tf.range(P)[None, None, :]) # [1, T, P]
+            if not is_train:
+                time_position_mask = time_position_mask[:,-1:,:] # This should be all True
 
-            #TODO(prkriley): broadcast of attn_mask is wrong; just need to restrict by out_len, which should be the last one?
+            #NOTE(prkriley): after some point in dimension T, every row is just out_len True values
             time_position_mask = tf.logical_and(time_position_mask, tf.cast(attn_mask[:,0,-1:,:], tf.bool)) # [batch_size, T, P]
-            #TODO(prkriley): fix dims of first and second input: 122 112
             position_logits = tf.where(time_position_mask, position_logits, tf.fill(tf.shape(position_logits), -1e9)) # [batch_size, T, P]
             position_logp = tf.nn.log_softmax(position_logits, axis=-1) # [batch_size, T, P]
             #TODO(prkriley): figure out finish_logp
                 #before based on out_len, which now is a function of T: (out_len - (T-1-t))
                 #out_len is at most P-1=T
-                #T-1-t is just range(T)
-            finish_logp_indices = out_len[:, None] - tf.range(T)[None, :] # [batch_size, T]
-            finish_logp_indices = tf.stack([tf.broadcast_to(tf.range(batch_size)[:, None], [batch_size, T]), tf.broadcast_to(tf.range(T)[None, :], [batch_size, T]), finish_logp_indices], axis=-1)
+                #T-1-t is just range(T) (but reversed, right?)
+                #final position is fixed at first and grows through T, but caps at out_len
+                    #starts at 1, max is min(T,out_len) = min(range(1, T+1), out_len)
+            #finish_logp_indices = out_len[:, None] - tf.range(T-1, -1, -1)[None, :] # [batch_size, T]
+            if is_train:
+                finish_logp_indices = tf.minimum(tf.range(1,T+1)[None, :], out_len[:, None]) # [batch_size, T]
+                finish_logp_indices = tf.stack([tf.broadcast_to(tf.range(batch_size)[:, None], [batch_size, T]), tf.broadcast_to(tf.range(T)[None, :], [batch_size, T]), finish_logp_indices], axis=-1) # [batch_size, T, 3]
+            else:
+                #NOTE(prkriley): tf.zeros because position_logp has already had the T dimension trimmed to the correct single value
+                finish_logp_indices = tf.stack([tf.range(batch_size)[:, None], tf.zeros(tf.shape(out_len[:, None]), dtype=out_len.dtype), out_len[:, None]], axis=-1) # [batch_size, T=1, 3]
             finish_logp = tf.gather_nd(position_logp, finish_logp_indices) # [batch_size, T]
 
             insert_position_logp = tf.where(time_position_mask[:,:,1:], 
@@ -185,9 +216,15 @@ class Transformer:
                                             tf.fill(tf.shape(position_logp[:,:,:-1]), -1e9)) # [batch_size, T, P-1]
             #TODO(prkriley): do token_logits: [batch_size, T, P-1, V]
             time_position_selector_for_tokens = self.logits_F(H_prime)[:,:,None,:] + position_selector[:,None,:-1,:] # [batch_size, T, P-1, hid_size]
+            #if is_train:
+                #pass
+            #else:
+                #time_position_selector_for_tokens = self.logits_F(H_prime[:,-1:,:])[:,:,None,:]
+                #time_position_selector_for_tokens = time_position_selector_for_tokens + position_selector[:,None,:-1,:] # [batch_size, T, P-1, hid_size]
+                #timestep_selector_for_position = tf.batch_gather(timestep_selector_for_position, out_len[:, None]) # [batch_size, T=1, hid_size]
             token_logits = self.logits_W(time_position_selector_for_tokens) # [batch_size, T, P-1, V]
 
-            token_logits = tf.Print(token_logits, [tf.shape(token_logits)], "token_logits.shape: ", summarize=4)
+            #token_logits = tf.Print(token_logits, [tf.shape(token_logits)], "token_logits.shape: ", summarize=4)
             token_logp_given_position = tf.nn.log_softmax(token_logits, axis=-1)
 
             insert_logp = insert_position_logp[:,:,:,None] + token_logp_given_position # [batch_size, T, P-1, V]

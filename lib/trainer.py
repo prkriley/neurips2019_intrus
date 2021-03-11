@@ -75,6 +75,7 @@ class SampleBasedTrainer:
                 'chosen_inserts': tf.placeholder('int64', [None, 4]),
                 'sample_indices': tf.placeholder('int32', [None]),
                 'sample_to_inp_indices': tf.placeholder('int32', [None]),
+                'relative_positions': tf.placeholder('int32', [None, None, None])
             }
             loss_on_slice, counters_on_slice = self.get_loss_and_counters(
                 self.slice_ph, self.cached_enc_state, is_train=is_train,
@@ -185,13 +186,13 @@ class SampleBasedTrainer:
             #NOTE(prkriley): should we do this by slice or something?
 
           batch_trajectories += these_trajectories
-        #print("Trajectory sampling time: {}".format(time.time() - timestamp))
+        print("Trajectory sampling time: {}".format(time.time() - timestamp))
         #NOTE(prkriley): batch_trajectories elements will have the logp_any_ref in them somewhere
         #NOTE(prkriley): length of batch_trajectories is less than batch_size*max_len
           
         timestamp = time.time()
         sess.run(self.fetch_before_batch)
-        #print("fetch_before_batch_time: {}".format(time.time() - timestamp))
+        print("fetch_before_batch_time: {}".format(time.time() - timestamp))
 
         # step 3: process hypos with decoder, accumulate gradients at encoder
         # 3.1 split data into slices
@@ -214,15 +215,15 @@ class SampleBasedTrainer:
                 slices = form_adaptive_batches(batch_trajectories,
                                                slice_max_len,
                                                cost_func=lambda row: linelen(row['hypo'])**2)
-        #print("Slicing time: {}".format(time.time() - timestamp))
+        print("Slicing time: {}".format(time.time() - timestamp))
 
         # 3.2 process hypos one slice at a time
         for i,slice in enumerate(slices):
 
             slice_feed = {key: [row[key] for row in slice] for key in slice[0].keys()}
 
-            slice_feed['out_len'] = [linelen(hypo) for hypo in slice_feed['hypo']] #TODO(prkriley):modify; actually just use ref_len instead
-            slice_feed['out'] = model.out_voc.to_matrix(slice_feed.pop('hypo')) #TODO(prkriley):modify
+            slice_feed['out_len'] = [linelen(hypo) for hypo in slice_feed['hypo']]
+            slice_feed['out'] = model.out_voc.to_matrix(slice_feed.pop('hypo')) #TODO(prkriley):modify?
             slice_feed['ref_inserts'] = batch_inserts_to_coo(slice_feed['ref_inserts'], model.out_voc)
             slice_feed['chosen_inserts'] = batch_inserts_to_coo(slice_feed['chosen_inserts'], model.out_voc)
             slice_feed['ref_len'] = [reference_lengths[i] for i in slice_feed['out_to_inp_indices']]
@@ -232,12 +233,22 @@ class SampleBasedTrainer:
             sample_indices, sample_to_inp_indices = zip(*sorted(sample_to_inp_indices_dict.items()))
             #assert list(sample_indices) == list(range(len(sample_indices))), "Sample_indices: {}".format(sample_indices)
             slice_feed['sample_to_inp_indices'] = sample_to_inp_indices
+            #TODO(prkriley): figure out what to do given that some matrices are smaller; expand all to PxP, P=max(out_len)+1
+            P = max(slice_feed['out_len'])+1
+            for i in range(len(slice_feed['relative_positions'])):
+                #slice_feed['relative_positions'][i] = slice_feed['relative_positions'][i].resize(P,P)
+                size = slice_feed['out_len'][i]+1
+                assert slice_feed['relative_positions'][i].shape == (size, size)
+                #TODO(prkriley): I think having bogus values at ends of dimensions is currently a problem, need to change attention masks to get rid of bogus
+                slice_feed['relative_positions'][i] = np.pad(slice_feed['relative_positions'][i], ((0,P-size),(0,P-size)))
+            slice_feed['relative_positions'] = np.stack(slice_feed['relative_positions'], axis=0)
+            #slice_feed['relative_positions'] = np.stack([m.resize(P,P) for m in slice_feed['relative_positions']], axis=0)
 
             #NOTE(prkriley): this accumulates gradients from this slice, which are optimized later; fetch_on_slice has side-effects of doing that
             #NOTE(prkriley): to determine whether [batch] has all timesteps, look into slice_feed; UPDATE: it does
             timestamp = time.time()
             sess.run(self.fetch_on_slice, {self.slice_ph[k]: slice_feed[k] for k in self.slice_ph})
-            #print("Slice {} processing time: {}".format(i, time.time() - timestamp))
+            print("Slice {} processing time: {}".format(i, time.time() - timestamp))
 
         # step 4. compute remaining gradients through encoder
         encoder_feed = self.model.make_feed_dict(batch)
@@ -246,7 +257,7 @@ class SampleBasedTrainer:
         timestamp = time.time()
         sess.run(self.fetch_after_batch,
                  {self.encoder_batch_ph[k]: encoder_feed[k] for k in self.encoder_batch_ph})
-        #print("fetch_after_batch time: {}".format(time.time() - timestamp))
+        print("fetch_after_batch time: {}".format(time.time() - timestamp))
 
         metrics = sess.run(self.compute_metrics)
 
@@ -269,6 +280,7 @@ class SampleBasedTrainer:
         #NOTE(prkriley): confirmed: batch dimension is something less than [batch*time]; there is an id field (out_to_inp_indices) indicating which is which; need to accumulate P/Q accordingly
 
         # encode with cached enc state
+        assert not loss_use_PQ
         enc_batch_size = tf.shape(cached_enc_state['out'])[0]
         with tf.control_dependencies([tf.assert_equal(tf.shape(tensor)[0], enc_batch_size)
                                       for tensor in nested_flatten(cached_enc_state)]):
@@ -286,13 +298,13 @@ class SampleBasedTrainer:
         # get reference inserts
         is_ref_insert = inserts_coo_to_tensor(batch_ph['ref_inserts'],
                                               tf.shape(batch_ph['out']),
-                                              len(self.model.out_voc))
+                                              len(self.model.out_voc)) # [batch_size, T, nout, voc_size]
         is_chosen_insert = inserts_coo_to_tensor(batch_ph['chosen_inserts'],
                                                  tf.shape(batch_ph['out']),
                                                  len(self.model.out_voc))
 
         # compute log-probability of any reference insert
-        neg_inf_like_logp = tf.fill(tf.shape(insert_logprobas), -1e9)
+        neg_inf_like_logp = tf.fill(tf.shape(insert_logprobas), -1e9) # [batch, T, nout, voc_size] (T = nout = P-1)
         ref_logp = tf.where(is_ref_insert, insert_logprobas, neg_inf_like_logp)
         chosen_logp = tf.where(is_chosen_insert, insert_logprobas, neg_inf_like_logp)
 
@@ -300,20 +312,23 @@ class SampleBasedTrainer:
         #NOTE(prkriley): log(P/Q) is tf.reduce_logsumexp(ref_logp, axis=(1,2)) which is shape [batch_size]
         #NOTE(prkriley): still need to accumulate, duplicate, stop-grad, and multiply by logp_ref_inserts
         #NOTE(prkriley): look into tf.unsorted_segment_sum; I think enc_batch_size is true batch size
-        logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(1, 2))
-        # ^-- [batch_size]
+        #TODO(prkriley): should this be einsum or not?
+        #logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(1, 2))
+        logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(2, 3))
+        # ^-- [batch_size, T]
 
-        should_finish = tf.reduce_any(is_ref_insert[:, :, self.model.out_voc.eos], axis=-1)
+        should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
 
-        log_PQ_ratio = tf.where(should_finish, finish_logprobas, tf.reduce_logsumexp(ref_logp, axis=(1,2))) #[batch_size] = [enc_batch_size*num_samples*timesteps]
-        #log_PQ_ratio = tf.Print(log_PQ_ratio, [log_PQ_ratio], "log_PQ_ratio: ")
-        #log_PQ_ratio = tf.Print(log_PQ_ratio, [batch_ph['out_to_inp_indices']], "out_to_inp_indices: ")
+        if loss_use_PQ:
+            log_PQ_ratio = tf.where(should_finish, finish_logprobas, tf.reduce_logsumexp(ref_logp, axis=(1,2))) #[batch_size] = [enc_batch_size*num_samples*timesteps]
+            #log_PQ_ratio = tf.Print(log_PQ_ratio, [log_PQ_ratio], "log_PQ_ratio: ")
+            #log_PQ_ratio = tf.Print(log_PQ_ratio, [batch_ph['out_to_inp_indices']], "out_to_inp_indices: ")
 
-        #TODO(prkriley): for multi sample, need PQ for each sample separately, so need sample id array
-        #TODO(prkriley): what would it take to make this a sorted segment sum?
-        log_PQ_ratio_by_sample = tf.segment_sum(log_PQ_ratio, batch_ph['sample_indices']) #timesteps removed, [enc_batch_size*num_samples]
+            #TODO(prkriley): for multi sample, need PQ for each sample separately, so need sample id array
+            #TODO(prkriley): what would it take to make this a sorted segment sum?
+            log_PQ_ratio_by_sample = tf.segment_sum(log_PQ_ratio, batch_ph['sample_indices']) #timesteps removed, [enc_batch_size*num_samples]
         #TODO(prkriley): I think I have some dims wrong in the two batch_ph index arrays; double-check
-        if loss_scale_PQ:
+        if loss_use_PQ and loss_scale_PQ:
           #sum by unique enc+samp id, normalize by enc id
           #if sample_indices is unique, packed, and sorted, we can do:
               #this is a vector of length num_samples*enc_batch_size, contains log PQ for whole sequence, sorted by encoder id
@@ -327,7 +342,7 @@ class SampleBasedTrainer:
           expanded_log_PQ = tf.gather(normalized_log_PQ_ratio_by_sample, batch_ph['sample_indices'])
 
           
-        else:
+        elif loss_use_PQ:
           expanded_log_PQ = tf.gather(log_PQ_ratio_by_sample, batch_ph['sample_indices'])
         #expanded_log_PQ = tf.Print(expanded_log_PQ,[expanded_log_PQ], "expanded_log_PQ: ")
         #accumulated_log_PQ_ratio = tf.unsorted_segment_sum(log_PQ_ratio, batch_ph['out_to_inp_indices'], enc_batch_size) #[enc_batch_size]
@@ -343,7 +358,8 @@ class SampleBasedTrainer:
           #expanded_log_PQ += 10
 
         #expanded_PQ = tf.stop_gradient(tf.gather(tf.exp(accumulated_log_PQ_ratio), batch_ph['out_to_inp_indices'])) #[batch_size]
-        expanded_PQ = tf.stop_gradient(tf.exp(expanded_log_PQ))
+        if loss_use_PQ:
+            expanded_PQ = tf.stop_gradient(tf.exp(expanded_log_PQ))
         #expanded_PQ = tf.Print(expanded_PQ, [expanded_PQ], "expanded PQ: ")
 
         #normalize to sum to 1
@@ -401,9 +417,11 @@ class SampleBasedTrainer:
 
         # metrics
         p_correct_numerator = tf.reduce_sum(tf.exp(-xent_values)) #TODO(prkriley): determine how this is used; with PQ it is no longer semantically accurate
-        argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, -1]), axis=-1)
-        is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, -1]),
-                                         tf.stack([tf.range(batch_size), tf.to_int32(argmax_flat)], -1))
+        T = tf.shape(insert_logprobas)[1]
+        argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, T, -1]), axis=-1)
+        #TODO(prkriley): this is rank 1, should be 2
+        is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, T, -1]),
+                tf.stack([tf.broadcast_to(tf.range(batch_size)[:, None], [batch_size, T]), tf.broadcast_to(tf.range(T)[None, :], [batch_size, T]), tf.to_int32(argmax_flat)], -1))
 
         is_argmax_correct = tf.where(should_finish, tf.exp(finish_logprobas) >= 0.5, is_argmax_correct)
 
@@ -487,6 +505,8 @@ class FixedOrderTrainer(SampleBasedTrainer):
         should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
 
         #TODO(prkriley): fix
+        #TODO(prkriley): why is this einsum and not reduce_logsumexp? ANSWER: only one ref so only bt actual values
+            #ALSO does the division on the following lines cover it?
         logp_ref = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
         # equivalent to tf.reduce_sum(insert_logprobas * mask_correct, (1, 2)), but without tmp tensor
 
@@ -508,7 +528,6 @@ class FixedOrderTrainer(SampleBasedTrainer):
             # ^-- [batch_size]
             xent_numerator = tf.reduce_sum(xent_values * weights)
 
-
         batch_size = tf.shape(insert_logprobas)[0]
         counters = dict(
             batch_size=tf.to_float(batch_size),
@@ -522,7 +541,8 @@ class FixedOrderTrainer(SampleBasedTrainer):
         p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref))
         T = tf.shape(insert_logprobas)[1]
         argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, T, -1]), axis=-1)
-        #TODO(prkriley): fix
+        
+        # [batch_size, T, nout*voc_size]
         is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, T, -1]),
                 tf.stack([tf.broadcast_to(tf.range(batch_size)[:,None], [batch_size, T]), tf.broadcast_to(tf.range(T)[None,:], [batch_size, T]), tf.to_int32(argmax_flat)], -1))
         is_argmax_correct = tf.where(should_finish, tf.exp(finish_logprobas) >= 0.5, is_argmax_correct)

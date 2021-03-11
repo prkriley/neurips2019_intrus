@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 import lib.ops
-from lib.oracle import get_optimal_inserts, inserts_coo_to_tensor, batch_inserts_to_coo
+from lib.oracle import get_optimal_inserts, inserts_coo_to_tensor, batch_inserts_to_coo, relative_positions_matrix_and_prod_order, extend_relative_positions_matrix
 from lib.util import nested_flatten, nested_map, make_batch_placeholder
 import sys
 
@@ -16,8 +16,9 @@ class BeamSearchInserts:
         :type model: lib.models.Transformer
         """
 
+        assert not is_train
         self.model = model
-        self.batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample()))
+        self.batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample(), dummy_relative_positions=True))
 
         self.k_best = tf.placeholder('int32', [])
         self.hypo_base_logprobs = tf.placeholder('float32', [None])  # [batch_size]
@@ -47,12 +48,11 @@ class BeamSearchInserts:
         enc_reordered = {k: tf.gather(v, out_to_inp_ix) for k, v in self.cached_enc_state.items()}
 
         # step 3: compute logits and action log-probs for inserting tokens and finishing
-        logp = model.compute_action_logprobs(self.batch_ph, is_train, enc=enc_reordered, debug_inference=True)
+        logp = model.compute_action_logprobs(self.batch_ph, is_train, enc=enc_reordered, debug_inference=False)
+        #NOTE(prkriley): both entries' second dimension is of size 1, corresponding to one timestep (at the end)
 
         ###################
         # insert operation
-        #TODO(prkriley): I think the solution is to always look at the last timestep
-        #TODO(prkriley): consider an inference-only compute_action_logprobs that only calcs for last timestep
         hypo_logprobs_insert = self.hypo_base_logprobs[:, None, None] + logp['insert'][:,-1,:,:]
         # ^-- [batch, position, token]
         hypo_logprobs_insert -= 1e9 * tf.to_float(tf.logical_not(self.allowed_tokens))
@@ -72,7 +72,6 @@ class BeamSearchInserts:
         # eos operation
         print('WARNING: Double-check inference!')
         self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish'][:, -1]
-        #TODO(prkriley): maybe doing -1 is wrong? does it depend on how long that sequence actually was?
 
     def translate_line(self, src, beam_size=32, max_steps=None, beam_spread=float('inf'),
                        sess=None, verbose=False, eos_in_beam=True):
@@ -95,14 +94,24 @@ class BeamSearchInserts:
         #TODO(prkriley): fix hypo_base_logprobs shape; was [batch], should probably be [batch, T] now? need to think about this
             #aligning dims indicates it is needed, but unclear if we really need all T steps at once in beam search
             #NOTE that this class is only used to actually decode; not really in training (though used for dev performance)
-        beam, beam_logp = [''], [0.0]
+        #TODO(prkriley): make beam be strings and order matrices
+        surface_beam, beam_logp = [''], [0.0]
+        prod_beam = ['']
+        R_init, prod_order_init = relative_positions_matrix_and_prod_order()
+        R_beam = [R_init]
+        prod_order_beam = [prod_order_init]
+        #R_init, extend_R_init = relative_positions_matrix_and_extender()
+        #beam, beam_logp = [('', R, extend_R)], [0.0]
 
         # save encoder state to tf variables
+        #TODO(prkriley): should this make relative_positions explicitly not present, or None?
         enc_feed = self.model.make_feed_dict([(src, '')])
         sess.run(self.compute_enc_state, {self.batch_ph[k]: enc_feed[k] for k in enc_feed})
 
         for t in count():
-            feed = self.model.make_feed_dict([(src, hypo) for hypo in beam])
+            #feed = self.model.make_feed_dict([(src, hypo) for hypo, R, extend_R in beam], relative_positions_matrix=None) #TODO(prkriley): replace None
+            capped_R_beam = [extend_relative_positions_matrix(R, prod_ord, None)[0] for R, prod_ord in zip(R_beam, prod_order_beam)]
+            feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=capped_R_beam) #TODO(prkriley): replace None, and use prod order for hypo
             feed = {self.batch_ph[k]: feed[k] for k in feed}
             feed[self.k_best] = beam_size
             feed[self.hypo_base_logprobs] = beam_logp
@@ -112,7 +121,7 @@ class BeamSearchInserts:
 
             ###
             # handle terminations (eos)
-            for finished_hypo, finished_hypo_logp in zip(beam, termination_logp):
+            for finished_hypo, finished_hypo_logp in zip(surface_beam, termination_logp):
                 if eos_in_beam and finished_hypo_logp < min(new_logp):
                     finished_hypo_logp = finished_hypo_logp - 1e9
                 # trajectory termination
@@ -123,33 +132,40 @@ class BeamSearchInserts:
                 # the correct way to compute logp(Y) = log(p(tau1) + p(tau2)), which is done with logaddexp
 
             ###
+            #TODO(prkriley): insert in production order, NOT surface order, and figure out how R works
             # handle inserts
-            new_beam, new_beam_logp = [], []
+            new_surface_beam, new_prod_beam, new_R_beam, new_prod_order_beam, new_beam_logp = [], [], [], [], []
             for hypo_ix, insert_i, token_i, hypo_logp in zip(hypo_ix, insert_at, insert_token_ix, new_logp):
-                hypo = beam[hypo_ix]
+                hypo = surface_beam[hypo_ix]
                 assert token_i != self.model.out_voc.eos
                 hypo_tok = hypo.split()
-                hypo_tok.insert(insert_i, self.model.out_voc.words(token_i))
+                hypo_tok.insert(insert_i, self.model.out_voc.words(token_i)) #TODO(prkriley): make this just append, but extend R
                 hypo = ' '.join(hypo_tok)
 
-                if hypo in new_beam:
+                #TODO(prkriley): actually need to preserve surface order to collapse beams properly
+                if hypo in new_surface_beam:
                     # merge hypo trajectory with another trajectory in beam that has higher score
                     # (older hypo's score is better since we've sorted them from highest score to lowest)
-                    prev_ix = new_beam.index(hypo)
+                    prev_ix = new_surface_beam.index(hypo)
                     new_beam_logp[prev_ix] = np.logaddexp(new_beam_logp[prev_ix], hypo_logp)
 
                 elif hypo_logp + beam_spread >= best_finished_logp:
-                    new_beam.append(hypo)
+                    new_surface_beam.append(hypo)
+                    prod_hypo = prod_beam[hypo_ix] + ' ' + self.model.out_voc.words(token_i)
+                    new_prod_beam.append(prod_hypo)
+                    new_R, new_prod_order = extend_relative_positions_matrix(R_beam[hypo_ix], prod_order_beam[hypo_ix], (insert_i, token_i)) #token_i is unused
+                    new_R_beam.append(new_R)
+                    new_prod_order_beam.append(new_prod_order)
                     new_beam_logp.append(hypo_logp)
                 else:
                     pass  # pruned by beam spread
 
-            beam, beam_logp = new_beam, new_beam_logp
+            surface_beam, beam_logp, prod_beam, R_beam, prod_order_beam = new_surface_beam, new_beam_logp, new_prod_beam, new_R_beam, new_prod_order_beam
 
-            if not len(beam): break
+            if not len(surface_beam): break
             if max_steps is not None and t >= max_steps: break
             if verbose:
-                print('%f %s' % (beam_logp[0], beam[0]))
+                print('%f %s' % (beam_logp[0], surface_beam[0])) #TODO(prkriley): may need to change indexing
 
         return finished_translation_logp
 
@@ -173,7 +189,7 @@ class SampleReferenceInserts:
         """
 
         self.model = model
-        self.batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample()))
+        self.batch_ph = make_batch_placeholder(model.make_feed_dict(model._get_batch_sample(), dummy_relative_positions=True))
         self.batch_ph['out_to_inp_indices'] = tf.placeholder('int64', [None])  # [batch_size]
         self.batch_ph['ref_inserts'] = tf.placeholder('int64', [None, 4])
 
@@ -233,7 +249,7 @@ class SampleReferenceInserts:
         logp_any_ref = tf.reduce_logsumexp(logprobs_flat, axis=-1)  # [batch_size, T]
         self.logp_any_ref = tf.where(is_terminated, action_logp['finish'], logp_any_ref)
 
-    def generate_trajectories(self, batch, sess=None):
+    def generate_trajectories(self, batch, sess=None, truncate_to=None):
         """
         Samples trajectories that start at empty hypothesis and end on reference lines
         :param batch: a sequence of pairs[(inp_line, ref_out_line)]
@@ -248,6 +264,8 @@ class SampleReferenceInserts:
         hypos_tok = [list() for _ in ref_lines]
         out_voc = self.model.out_voc
         hypos_ref_tok = [out_voc.words(out_voc.ids(ref_line.split())) for ref_line in ref_lines]
+        if truncate_to:
+            hypos_ref_tok = [hrf[:truncate_to] for hrf in hypos_ref_tok]
         hypos_to_indices = list(range(len(inp_lines)))
         # ^-- inp_line index for each hypo in hypo_tok. hypos for shorter inp_lines will terminate earlier.
 
@@ -255,6 +273,7 @@ class SampleReferenceInserts:
         #NOTE(prkriley): probably can't accumulate here, but we yield each logp_any_ref; accumulate at caller/iterator
         DEBUG_it = -1
         DEBUG_dump_str = ''
+        #TODO(prkriley): need to keep track of R's and prod_orders 
         while len(hypos_tok):
             DEBUG_it += 1
             # step 1, find all allowed inserts
@@ -280,7 +299,7 @@ class SampleReferenceInserts:
             hypo_inp_lines = [inp_lines[i] for i in hypos_to_indices]
 
             sample_inp = self.model._get_batch_sample()[0]
-            feed = self.model.make_feed_dict([(*sample_inp[:1], hypo, *sample_inp[2:]) for hypo in hypo_lines])
+            feed = self.model.make_feed_dict([(*sample_inp[:1], hypo, *sample_inp[2:]) for hypo in hypo_lines]) #TODO(prkriley): add R
             del feed['inp']
             if 'inp_len' in feed:  # we don't need inp cuz we use pre-computed enc state
                 del feed['inp_len']
