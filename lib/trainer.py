@@ -158,6 +158,7 @@ class SampleBasedTrainer:
         :param slice_max_len: maximum length of a single slice of hypotheses (in tokens)
         :return: total loss
         """
+        DEBUG_TIMING = False
         assert optimizer_step or not reset_counters, "do not reset counters if you don't optimize." \
                                                      "Counters contain statistics used for apply_gradients"
         sess, model = self.sess, self.model
@@ -186,13 +187,15 @@ class SampleBasedTrainer:
             #NOTE(prkriley): should we do this by slice or something?
 
           batch_trajectories += these_trajectories
-        print("Trajectory sampling time: {}".format(time.time() - timestamp))
+        if DEBUG_TIMING:
+            print("Trajectory sampling time: {}".format(time.time() - timestamp))
         #NOTE(prkriley): batch_trajectories elements will have the logp_any_ref in them somewhere
         #NOTE(prkriley): length of batch_trajectories is less than batch_size*max_len
           
         timestamp = time.time()
         sess.run(self.fetch_before_batch)
-        print("fetch_before_batch_time: {}".format(time.time() - timestamp))
+        if DEBUG_TIMING:
+            print("fetch_before_batch_time: {}".format(time.time() - timestamp))
 
         # step 3: process hypos with decoder, accumulate gradients at encoder
         # 3.1 split data into slices
@@ -215,7 +218,8 @@ class SampleBasedTrainer:
                 slices = form_adaptive_batches(batch_trajectories,
                                                slice_max_len,
                                                cost_func=lambda row: linelen(row['hypo'])**2)
-        print("Slicing time: {}".format(time.time() - timestamp))
+        if DEBUG_TIMING:
+            print("Slicing time: {}".format(time.time() - timestamp))
 
         # 3.2 process hypos one slice at a time
         for i,slice in enumerate(slices):
@@ -248,7 +252,8 @@ class SampleBasedTrainer:
             #NOTE(prkriley): to determine whether [batch] has all timesteps, look into slice_feed; UPDATE: it does
             timestamp = time.time()
             sess.run(self.fetch_on_slice, {self.slice_ph[k]: slice_feed[k] for k in self.slice_ph})
-            print("Slice {} processing time: {}".format(i, time.time() - timestamp))
+            if DEBUG_TIMING:
+                print("Slice {} processing time: {}".format(i, time.time() - timestamp))
 
         # step 4. compute remaining gradients through encoder
         encoder_feed = self.model.make_feed_dict(batch)
@@ -257,7 +262,8 @@ class SampleBasedTrainer:
         timestamp = time.time()
         sess.run(self.fetch_after_batch,
                  {self.encoder_batch_ph[k]: encoder_feed[k] for k in self.encoder_batch_ph})
-        print("fetch_after_batch time: {}".format(time.time() - timestamp))
+        if DEBUG_TIMING:
+            print("fetch_after_batch time: {}".format(time.time() - timestamp))
 
         metrics = sess.run(self.compute_metrics)
 
