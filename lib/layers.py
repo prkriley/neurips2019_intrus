@@ -636,9 +636,9 @@ class MultiHeadAttn:
                 #KE = k[:, :, None, :, :] + E: [batch, n_heads, n_q, n_kv, kdim/n_heads]
                 #logits = tf.einsum('bhqd,bhqkd->bhqk',q,KE)
             if relative_positions is not None:
-                A = tf.broadcast_to(self.relative_embeddings.W[None, None, :, :], tf.concat([tf.shape(relative_positions)[:2], tf.shape(self.relative_embeddings.W)], axis=0))
+                A = tf.broadcast_to(self.relative_embeddings.W[None, None, :, :], tf.concat([tf.shape(relative_positions)[:2], tf.shape(self.relative_embeddings.W)], axis=0)) # [batch_size, n_q, 3, k_dim]
                 E = tf.batch_gather(A,relative_positions) # [batch_size, n_q, n_kv, k_dim]
-                E = self.split_heads_r4(E, self.num_heads)
+                E = self.split_heads_r4(E, self.num_heads) # [batch_size, n_heads, n_q, n_kv, k_dim/n_heads]
                 KE = k[:, :, None, :, :] + E
                 logits = tf.einsum('bhqd,bhqkd->bhqk', q, KE)
             else:

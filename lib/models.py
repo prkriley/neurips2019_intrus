@@ -150,6 +150,7 @@ class Transformer:
             dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
                                       enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=batch['relative_positions'])
             # ^-- [batch_size, nout + 1, hid_size]
+            #NOTE(prkriley): in second dimension, some suffix is bogus (represents timesteps past termination)
 
 
             ##########
@@ -173,6 +174,7 @@ class Transformer:
             T = P - 1
             H = dec_out # [batch_size, P, hid_size]
             H_prime = dec_out[:,:-1,:] # [batch_size, T, hid_size] or [batch_size, P-1, hid_size] depending on context
+            #TODO(prkriley): some suffix of second dimension (per batch index) is bogus, verify using correctly
             if not is_train:
                 H_prime = tf.batch_gather(H_prime, out_len[:, None]) # [batch_size, T=1, hid_size]
             position_selector = self.logits_D(H) # [batch_size, P, hid_size]
@@ -195,6 +197,7 @@ class Transformer:
             #NOTE(prkriley): after some point in dimension T, every row is just out_len True values
             time_position_mask = tf.logical_and(time_position_mask, tf.cast(attn_mask[:,0,-1:,:], tf.bool)) # [batch_size, T, P]
             position_logits = tf.where(time_position_mask, position_logits, tf.fill(tf.shape(position_logits), -1e9)) # [batch_size, T, P]
+            #NOTE(prkriley): P dimension is sanitary for position_logits because of attn_mask, T is NOT when training
             position_logp = tf.nn.log_softmax(position_logits, axis=-1) # [batch_size, T, P]
             #TODO(prkriley): figure out finish_logp
                 #before based on out_len, which now is a function of T: (out_len - (T-1-t))
@@ -210,11 +213,13 @@ class Transformer:
                 #NOTE(prkriley): tf.zeros because position_logp has already had the T dimension trimmed to the correct single value
                 finish_logp_indices = tf.stack([tf.range(batch_size)[:, None], tf.zeros(tf.shape(out_len[:, None]), dtype=out_len.dtype), out_len[:, None]], axis=-1) # [batch_size, T=1, 3]
             finish_logp = tf.gather_nd(position_logp, finish_logp_indices) # [batch_size, T]
+            #NOTE(prkriley): invalid positions in T dimension of finish_logp should have same value as the 1 true position
 
+            #TODO(prkriley): check whether truncing position_logp in 3rd dimnsion is correct; the last is NOT in general the terminate index, out_len determines; tpm is sanitary in 3rd, not in 2nd
+                #need each [batch_size, T] entry to be prefixed by trunc'd dist over actual inserts suffixed by masked; ACHIEVED by 1: clipping in tpm; result is insert_position_logp is sanitary in P-1, NOT in T
             insert_position_logp = tf.where(time_position_mask[:,:,1:], 
                                             position_logp[:,:,:-1], 
                                             tf.fill(tf.shape(position_logp[:,:,:-1]), -1e9)) # [batch_size, T, P-1]
-            #TODO(prkriley): do token_logits: [batch_size, T, P-1, V]
             time_position_selector_for_tokens = self.logits_F(H_prime)[:,:,None,:] + position_selector[:,None,:-1,:] # [batch_size, T, P-1, hid_size]
             #if is_train:
                 #pass

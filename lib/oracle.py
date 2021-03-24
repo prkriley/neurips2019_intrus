@@ -149,10 +149,10 @@ def extend_relative_positions_matrix(R, prod_order, chosen):
     i, new_prod_order = _map_chosen_to_prod(chosen,prod_order)
     v = R[i].copy()
     v[v == 1] = 0
-    return np.concatenate([np.concatenate((R,v[None,:]),axis=0), np.concatenate([2-v,[0]], axis=0)[:,None]],axis=1), new_prod_order
+    return np.concatenate([np.concatenate((R,v[None,:]),axis=0), np.concatenate([2-v,[1]], axis=0)[:,None]],axis=1), new_prod_order
 
 def relative_positions_matrix_and_prod_order():
-    return np.array([[0]]), [0]
+    return np.array([[1]]), [0]
 
 
 class GenerateReferenceInserts:

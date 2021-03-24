@@ -319,6 +319,7 @@ class SampleBasedTrainer:
         #NOTE(prkriley): still need to accumulate, duplicate, stop-grad, and multiply by logp_ref_inserts
         #NOTE(prkriley): look into tf.unsorted_segment_sum; I think enc_batch_size is true batch size
         #TODO(prkriley): should this be einsum or not?
+            #NO: maximize log of SUM of probabilities
         #logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(1, 2))
         logp_ref_inserts = tf.reduce_logsumexp(ref_logp if loss_use_logp_any_ref else chosen_logp, axis=(2, 3))
         # ^-- [batch_size, T]
@@ -513,10 +514,17 @@ class FixedOrderTrainer(SampleBasedTrainer):
         #TODO(prkriley): fix
         #TODO(prkriley): why is this einsum and not reduce_logsumexp? ANSWER: only one ref so only bt actual values
             #ALSO does the division on the following lines cover it?
-        logp_ref = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
+            #This is a sum of log probabilities, which is the same as product of probabilities, which is NOT what we really want (though moot because only one ref)
+        #proposal:
+        print("WARNING: Using updated calculation of probabilities, with commented division by num correct")
+        logp_ref = tf.where(mask_correct, insert_logprobas, tf.fill(tf.shape(insert_logprobas), -1e9))
+        logp_ref = tf.reduce_logsumexp(logp_ref, axis=(2,3))
+        #logp_ref_old = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
+        
         # equivalent to tf.reduce_sum(insert_logprobas * mask_correct, (1, 2)), but without tmp tensor
 
-        xent_values = logp_ref / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
+        #NOTE(prkriley): T dimension IS sanitary because mask_correct is fully good
+        #xent_values = logp_ref / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
         # logp_ref is divided by number of correct labels to properly compute xent
 
         xent_values = -tf.where(should_finish,
@@ -547,6 +555,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
         p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref))
         T = tf.shape(insert_logprobas)[1]
         argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, T, -1]), axis=-1)
+        #NOTE(prkriley): T dimension not sanitary, suffix is bogus
         
         # [batch_size, T, nout*voc_size]
         is_argmax_correct = tf.gather_nd(tf.reshape(is_ref_insert, [batch_size, T, -1]),

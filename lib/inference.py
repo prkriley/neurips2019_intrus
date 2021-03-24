@@ -91,10 +91,6 @@ class BeamSearchInserts:
         sess = sess or tf.get_default_session() or tf.InteractiveSession()
         finished_translation_logp = {}    # {dst -> logp(reach this hypo)}, used for pruning with beam spread
         best_finished_logp = -float('inf')
-        #TODO(prkriley): fix hypo_base_logprobs shape; was [batch], should probably be [batch, T] now? need to think about this
-            #aligning dims indicates it is needed, but unclear if we really need all T steps at once in beam search
-            #NOTE that this class is only used to actually decode; not really in training (though used for dev performance)
-        #TODO(prkriley): make beam be strings and order matrices
         surface_beam, beam_logp = [''], [0.0]
         prod_beam = ['']
         R_init, prod_order_init = relative_positions_matrix_and_prod_order()
@@ -111,7 +107,7 @@ class BeamSearchInserts:
         for t in count():
             #feed = self.model.make_feed_dict([(src, hypo) for hypo, R, extend_R in beam], relative_positions_matrix=None) #TODO(prkriley): replace None
             capped_R_beam = [extend_relative_positions_matrix(R, prod_ord, None)[0] for R, prod_ord in zip(R_beam, prod_order_beam)]
-            feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=capped_R_beam) #TODO(prkriley): replace None, and use prod order for hypo
+            feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=capped_R_beam)
             feed = {self.batch_ph[k]: feed[k] for k in feed}
             feed[self.k_best] = beam_size
             feed[self.hypo_base_logprobs] = beam_logp
