@@ -173,10 +173,17 @@ class Transformer:
             P = tf.shape(dec_out)[1]
             T = P - 1
             H = dec_out # [batch_size, P, hid_size]
+            #TODO(prkriley): :-1 is probably wrong; either need to do 1: or elide one entry from middle based on out_len
+                #may be able to mask? then cover :-1 with mask 1:?
+                #may be covered already by later masking
             H_prime = dec_out[:,:-1,:] # [batch_size, T, hid_size] or [batch_size, P-1, hid_size] depending on context
             #TODO(prkriley): some suffix of second dimension (per batch index) is bogus, verify using correctly
+            out_len = tf.Print(out_len, [out_len[0]], "out_len[0]: ", summarize=1000)
             if not is_train:
-                H_prime = tf.batch_gather(H_prime, out_len[:, None]) # [batch_size, T=1, hid_size]
+                #TODO(prkriley): out_len max value is T, so to index need out_len-1
+                #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]pre: ", summarize=1000)
+                H_prime = tf.batch_gather(H_prime, out_len[:, None] - 1) # [batch_size, T=1, hid_size]
+                #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]post: ", summarize=1000)
             position_selector = self.logits_D(H) # [batch_size, P, hid_size]
             timestep_selector_for_position = self.logits_E(H_prime) # [batch_size, T, hid_size]
             #TODO(prkriley): instead of -1, need to gather by actual last valid index

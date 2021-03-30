@@ -506,8 +506,9 @@ class FixedOrderTrainer(SampleBasedTrainer):
                                                  tf.shape(batch_ph['out']),
                                                  len(self.model.out_voc))
 
-        is_chosen_insert = tf.Print(is_chosen_insert, [is_chosen_insert[0]], "is_chosen_insert[0]: ", summarize=1000)
+        #is_chosen_insert = tf.Print(is_chosen_insert, [is_chosen_insert[0]], "is_chosen_insert[0]: ", summarize=1000)
         mask_correct = is_chosen_insert if loss_use_logp_chosen else is_ref_insert
+        mask_correct = tf.Print(mask_correct, [mask_correct[0]], "mask_correct[0]: ", summarize=1000)
 
         # assumes that reference inserts for ended hypo are EOS tokens and after-reference are NULL
         should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
