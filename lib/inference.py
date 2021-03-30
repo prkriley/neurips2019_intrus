@@ -55,7 +55,10 @@ class BeamSearchInserts:
         # insert operation
         hypo_logprobs_insert = self.hypo_base_logprobs[:, None, None] + logp['insert'][:,-1,:,:]
         # ^-- [batch, position, token]
+        #TODO(prkriley): why is eos ever possible after this masking? also what are the shapes here?
+            #I think possibly broadcasting because last dimensions match? not sure though
         hypo_logprobs_insert -= 1e9 * tf.to_float(tf.logical_not(self.allowed_tokens))
+        hypo_logprobs_insert = tf.Print(hypo_logprobs_insert, [hypo_logprobs_insert], "hypo_logprobs_insert: ", summarize=1000)
         best_inserts_flat = tf.nn.top_k(tf.reshape(hypo_logprobs_insert, [-1]), k=self.k_best, sorted=True)
 
         #TODO(prkriley): verify that ['out'] is used properly; we changed it to always be the ref

@@ -506,6 +506,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
                                                  tf.shape(batch_ph['out']),
                                                  len(self.model.out_voc))
 
+        is_chosen_insert = tf.Print(is_chosen_insert, [is_chosen_insert[0]], "is_chosen_insert[0]: ", summarize=1000)
         mask_correct = is_chosen_insert if loss_use_logp_chosen else is_ref_insert
 
         # assumes that reference inserts for ended hypo are EOS tokens and after-reference are NULL
@@ -518,12 +519,14 @@ class FixedOrderTrainer(SampleBasedTrainer):
         #proposal:
         print("WARNING: Using updated calculation of probabilities, with commented division by num correct")
         logp_ref = tf.where(mask_correct, insert_logprobas, tf.fill(tf.shape(insert_logprobas), -1e9))
+        logp_ref = tf.Print(logp_ref, [logp_ref[0]], "logp_ref[0]", summarize=1000)
         logp_ref = tf.reduce_logsumexp(logp_ref, axis=(2,3))
         #logp_ref_old = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
         
         # equivalent to tf.reduce_sum(insert_logprobas * mask_correct, (1, 2)), but without tmp tensor
 
         #NOTE(prkriley): T dimension IS sanitary because mask_correct is fully good
+        xent_values = logp_ref
         #xent_values = logp_ref / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
         # logp_ref is divided by number of correct labels to properly compute xent
 
