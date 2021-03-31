@@ -74,6 +74,8 @@ class BeamSearchInserts:
         ##################
         # eos operation
         print('WARNING: Double-check inference!')
+        #self.hypo_base_logprobs = tf.Print(self.hypo_base_logprobs, [self.hypo_base_logprobs], "self.hypo_base_logprobs: ", summarize=1000)
+        logp['finish'] = tf.Print(logp['finish'], [logp['finish']], "logp[finish]: ", summarize=1000)
         self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish'][:, -1]
 
     def translate_line(self, src, beam_size=32, max_steps=None, beam_spread=float('inf'),

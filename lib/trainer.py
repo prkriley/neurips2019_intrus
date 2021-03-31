@@ -497,6 +497,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
         logp = self.model.compute_action_logprobs(batch_ph, is_train=is_train, enc=enc_reordered)
         insert_logprobas = logp['insert']  # [batch, T, nout, voc_size]
         finish_logprobas = logp['finish']  # [batch, T]
+        finish_logprobas = tf.Print(finish_logprobas, [finish_logprobas[0]], "finish_logprobas[0]: ", summarize=1000)
 
         # get reference inserts
         is_ref_insert = inserts_coo_to_tensor(batch_ph['ref_inserts'],
@@ -512,28 +513,31 @@ class FixedOrderTrainer(SampleBasedTrainer):
 
         # assumes that reference inserts for ended hypo are EOS tokens and after-reference are NULL
         should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
+        should_finish = tf.Print(should_finish, [should_finish[0]], "should_finish[0]: ", summarize=1000)
 
         #TODO(prkriley): fix
         #TODO(prkriley): why is this einsum and not reduce_logsumexp? ANSWER: only one ref so only bt actual values
             #ALSO does the division on the following lines cover it?
             #This is a sum of log probabilities, which is the same as product of probabilities, which is NOT what we really want (though moot because only one ref)
         #proposal:
-        print("WARNING: Using updated calculation of probabilities, with commented division by num correct")
-        logp_ref = tf.where(mask_correct, insert_logprobas, tf.fill(tf.shape(insert_logprobas), -1e9))
-        logp_ref = tf.Print(logp_ref, [logp_ref[0]], "logp_ref[0]", summarize=1000)
-        logp_ref = tf.reduce_logsumexp(logp_ref, axis=(2,3))
-        #logp_ref_old = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
-        
+        #print("WARNING: Using updated calculation of probabilities, with commented division by num correct")
+        print("WARNING: Using baseline but possibly wrong einsum calculation for multi-ref probabilities")
+        #logp_ref = tf.where(mask_correct, insert_logprobas, tf.fill(tf.shape(insert_logprobas), -1e9))
+        #logp_ref = tf.Print(logp_ref, [logp_ref[0]], "logp_ref[0]", summarize=1000)
+        #logp_ref = tf.reduce_logsumexp(logp_ref, axis=(2,3))
+
+        logp_ref_old = tf.einsum("btnl,btnl->bt", insert_logprobas, tf.to_float(mask_correct))
         # equivalent to tf.reduce_sum(insert_logprobas * mask_correct, (1, 2)), but without tmp tensor
 
         #NOTE(prkriley): T dimension IS sanitary because mask_correct is fully good
-        xent_values = logp_ref
-        #xent_values = logp_ref / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
+        #xent_values = logp_ref
+        xent_values = logp_ref_old / (tf.reduce_sum(tf.to_float(mask_correct), (-2, -1)) + 1e-5)
         # logp_ref is divided by number of correct labels to properly compute xent
 
         xent_values = -tf.where(should_finish,
                                 finish_logprobas,
                                 xent_values)
+        xent_values = tf.Print(xent_values, [xent_values[0]], "xent_values[0]: ", summarize=1000)
         # ^-- [batch_size, T]
 
         if eos_coeff is None:
@@ -556,7 +560,8 @@ class FixedOrderTrainer(SampleBasedTrainer):
         loss_numerator = xent_numerator
 
         # metrics
-        p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref))
+        #p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref))
+        p_correct_numerator = tf.reduce_sum(tf.exp(logp_ref_old))
         T = tf.shape(insert_logprobas)[1]
         argmax_flat = tf.argmax(tf.reshape(insert_logprobas, [batch_size, T, -1]), axis=-1)
         #NOTE(prkriley): T dimension not sanitary, suffix is bogus
