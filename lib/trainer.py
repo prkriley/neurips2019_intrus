@@ -497,7 +497,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
         logp = self.model.compute_action_logprobs(batch_ph, is_train=is_train, enc=enc_reordered)
         insert_logprobas = logp['insert']  # [batch, T, nout, voc_size]
         finish_logprobas = logp['finish']  # [batch, T]
-        finish_logprobas = tf.Print(finish_logprobas, [finish_logprobas[0]], "finish_logprobas[0]: ", summarize=1000)
+        #finish_logprobas = tf.Print(finish_logprobas, [finish_logprobas[0]], "finish_logprobas[0]: ", summarize=1000)
 
         # get reference inserts
         is_ref_insert = inserts_coo_to_tensor(batch_ph['ref_inserts'],
@@ -509,11 +509,11 @@ class FixedOrderTrainer(SampleBasedTrainer):
 
         #is_chosen_insert = tf.Print(is_chosen_insert, [is_chosen_insert[0]], "is_chosen_insert[0]: ", summarize=1000)
         mask_correct = is_chosen_insert if loss_use_logp_chosen else is_ref_insert
-        mask_correct = tf.Print(mask_correct, [mask_correct[0]], "mask_correct[0]: ", summarize=1000)
+        #mask_correct = tf.Print(mask_correct, [mask_correct[0]], "mask_correct[0]: ", summarize=1000)
 
         # assumes that reference inserts for ended hypo are EOS tokens and after-reference are NULL
         should_finish = tf.reduce_any(is_ref_insert[:, :, :, self.model.out_voc.eos], axis=-1) # [batch, T]
-        should_finish = tf.Print(should_finish, [should_finish[0]], "should_finish[0]: ", summarize=1000)
+        #should_finish = tf.Print(should_finish, [should_finish[0]], "should_finish[0]: ", summarize=1000)
 
         #TODO(prkriley): fix
         #TODO(prkriley): why is this einsum and not reduce_logsumexp? ANSWER: only one ref so only bt actual values
@@ -537,7 +537,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
         xent_values = -tf.where(should_finish,
                                 finish_logprobas,
                                 xent_values)
-        xent_values = tf.Print(xent_values, [xent_values[0]], "xent_values[0]: ", summarize=1000)
+        #xent_values = tf.Print(xent_values, [xent_values[0]], "xent_values[0]: ", summarize=1000)
         # ^-- [batch_size, T]
 
         if eos_coeff is None:

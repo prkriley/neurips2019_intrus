@@ -58,7 +58,7 @@ class BeamSearchInserts:
         #TODO(prkriley): why is eos ever possible after this masking? also what are the shapes here?
             #I think possibly broadcasting because last dimensions match? not sure though
         hypo_logprobs_insert -= 1e9 * tf.to_float(tf.logical_not(self.allowed_tokens))
-        hypo_logprobs_insert = tf.Print(hypo_logprobs_insert, [hypo_logprobs_insert], "hypo_logprobs_insert: ", summarize=1000)
+        #hypo_logprobs_insert = tf.Print(hypo_logprobs_insert, [hypo_logprobs_insert], "hypo_logprobs_insert: ", summarize=1000)
         best_inserts_flat = tf.nn.top_k(tf.reshape(hypo_logprobs_insert, [-1]), k=self.k_best, sorted=True)
 
         #TODO(prkriley): verify that ['out'] is used properly; we changed it to always be the ref
@@ -74,8 +74,7 @@ class BeamSearchInserts:
         ##################
         # eos operation
         print('WARNING: Double-check inference!')
-        #self.hypo_base_logprobs = tf.Print(self.hypo_base_logprobs, [self.hypo_base_logprobs], "self.hypo_base_logprobs: ", summarize=1000)
-        logp['finish'] = tf.Print(logp['finish'], [logp['finish']], "logp[finish]: ", summarize=1000)
+        #logp['finish'] = tf.Print(logp['finish'], [logp['finish']], "logp[finish]: ", summarize=1000)
         self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish'][:, -1]
 
     def translate_line(self, src, beam_size=32, max_steps=None, beam_spread=float('inf'),
@@ -111,8 +110,9 @@ class BeamSearchInserts:
 
         for t in count():
             #feed = self.model.make_feed_dict([(src, hypo) for hypo, R, extend_R in beam], relative_positions_matrix=None) #TODO(prkriley): replace None
-            capped_R_beam = [extend_relative_positions_matrix(R, prod_ord, None)[0] for R, prod_ord in zip(R_beam, prod_order_beam)]
-            feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=capped_R_beam)
+            #capped_R_beam = [extend_relative_positions_matrix(R, prod_ord, None)[0] for R, prod_ord in zip(R_beam, prod_order_beam)]
+            #feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=capped_R_beam)
+            feed = self.model.make_feed_dict([(src, hypo) for hypo in prod_beam], relative_positions_matrices=R_beam)
             feed = {self.batch_ph[k]: feed[k] for k in feed}
             feed[self.k_best] = beam_size
             feed[self.hypo_base_logprobs] = beam_logp

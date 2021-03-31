@@ -60,7 +60,8 @@ class Voc:
         matrix = np.full((len(sequences), max_len), fill_value=self.eos, dtype='int32')
         for i, seq in enumerate(sequences):
             tokens = self.ids(seq)[:max_len]
-            matrix[i, :len(tokens)] = tokens
+            #matrix[i, :len(tokens)] = tokens
+            matrix[i, 1:len(tokens)+1] = tokens
         return matrix
 
     def to_lines(self, indices, deprocess=True):

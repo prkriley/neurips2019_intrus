@@ -137,11 +137,12 @@ def inserts_coo_to_tensor(inserts_coo, hypo_shape, voc_size, dtype=tf.bool, spar
 def _map_chosen_to_prod(chosen, prod_order):
     new_prod_order = prod_order.copy()
     if chosen is None:
+        raise ValueError("Using None for relative positions is no longer supported!")
         i = prod_order[-1]
         new_prod_order.insert(len(prod_order), len(prod_order))
     else:
         i = prod_order[chosen[0]]
-        new_prod_order.insert(chosen[0]+1, len(prod_order))
+        new_prod_order.insert(chosen[0]+1, len(prod_order)+1)
     return i, new_prod_order
 
 def extend_relative_positions_matrix(R, prod_order, chosen):
@@ -152,7 +153,7 @@ def extend_relative_positions_matrix(R, prod_order, chosen):
     return np.concatenate([np.concatenate((R,v[None,:]),axis=0), np.concatenate([2-v,[1]], axis=0)[:,None]],axis=1), new_prod_order
 
 def relative_positions_matrix_and_prod_order():
-    return np.array([[1]]), [0]
+    return np.array([[1,2],[0,1]]), [0]
 
 
 class GenerateReferenceInserts:
@@ -219,11 +220,12 @@ class GenerateReferenceInserts:
             R, prod_order = relative_positions_matrix_and_prod_order()
             prod_tokens = []
             for hypo, inserts, chosen in trajectory:
-                R, prod_order = extend_relative_positions_matrix(R, prod_order, chosen)
+                #R, prod_order = extend_relative_positions_matrix(R, prod_order, chosen)
                 if chosen is None:  # nothing to insert
                     inserts = [{out_voc.EOS} for _ in inserts]
                     chosen = (random.randint(0, len(inserts)), out_voc.EOS)
                 else:
+                    R, prod_order = extend_relative_positions_matrix(R, prod_order, chosen)
                     prod_tokens.append(chosen[1])
                 #TODO(prkriley): determine whether we need to do something special when chosen is none for prod_order
                 chosen = [{chosen[1]} if i == chosen[0] else set() for i in range(len(inserts))]
