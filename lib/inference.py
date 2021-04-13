@@ -58,10 +58,9 @@ class BeamSearchInserts:
         #TODO(prkriley): why is eos ever possible after this masking? also what are the shapes here?
             #I think possibly broadcasting because last dimensions match? not sure though
         hypo_logprobs_insert -= 1e9 * tf.to_float(tf.logical_not(self.allowed_tokens))
-        #hypo_logprobs_insert = tf.Print(hypo_logprobs_insert, [hypo_logprobs_insert], "hypo_logprobs_insert: ", summarize=1000)
+        hypo_logprobs_insert = tf.Print(hypo_logprobs_insert, [hypo_logprobs_insert[:2,:5,:10]], "hypo_logprobs_insert[:2B,:5P,:10V]: ", summarize=1000)
         best_inserts_flat = tf.nn.top_k(tf.reshape(hypo_logprobs_insert, [-1]), k=self.k_best, sorted=True)
 
-        #TODO(prkriley): verify that ['out'] is used properly; we changed it to always be the ref
         batch_size, max_len = tf.shape(self.batch_ph['out'])[0], tf.shape(self.batch_ph['out'])[1]
         voc_size = len(model.out_voc)
 
@@ -74,11 +73,11 @@ class BeamSearchInserts:
         ##################
         # eos operation
         print('WARNING: Double-check inference!')
-        #logp['finish'] = tf.Print(logp['finish'], [logp['finish']], "logp[finish]: ", summarize=1000)
+        logp['finish'] = tf.Print(logp['finish'], [logp['finish'][:5, :]], "logp[finish][:5,:]: ", summarize=1000)
         self.finished_hypo_logprobs = self.hypo_base_logprobs + logp['finish'][:, -1]
 
     def translate_line(self, src, beam_size=32, max_steps=None, beam_spread=float('inf'),
-                       sess=None, verbose=False, eos_in_beam=True):
+                       sess=None, verbose=False, eos_in_beam=True, debug=False):
         """
         Translates a single line using beam search
         :param src: string, space-separated source tokens
@@ -131,6 +130,8 @@ class BeamSearchInserts:
                 best_finished_logp = max(best_finished_logp, finished_translation_logp[finished_hypo])
                 # ^-- wtf happens here: if there are several trajectories tau1, tau2 that lead to the same Y,
                 # the correct way to compute logp(Y) = log(p(tau1) + p(tau2)), which is done with logaddexp
+                if debug:
+                    print('Finished hypo {} with logp {}'.format(finished_hypo, finished_hypo_logp))
 
             ###
             #TODO(prkriley): insert in production order, NOT surface order, and figure out how R works
@@ -139,9 +140,14 @@ class BeamSearchInserts:
             for hypo_ix, insert_i, token_i, hypo_logp in zip(hypo_ix, insert_at, insert_token_ix, new_logp):
                 hypo = surface_beam[hypo_ix]
                 assert token_i != self.model.out_voc.eos
+                if debug:
+                    print('Inserting token_i {} at position {} into ({}) with logp {}'.format(token_i, insert_i, hypo, hypo_logp))
                 hypo_tok = hypo.split()
-                hypo_tok.insert(insert_i, self.model.out_voc.words(token_i)) #TODO(prkriley): make this just append, but extend R
+                #TODO(prkriley): did insert_i semantics change with moving EOS to beginning?
+                hypo_tok.insert(insert_i, self.model.out_voc.words(token_i))
                 hypo = ' '.join(hypo_tok)
+                if debug:
+                    print('Resulting hypo: ({})'.format(hypo))
 
                 #TODO(prkriley): actually need to preserve surface order to collapse beams properly
                 if hypo in new_surface_beam:
@@ -149,6 +155,8 @@ class BeamSearchInserts:
                     # (older hypo's score is better since we've sorted them from highest score to lowest)
                     prev_ix = new_surface_beam.index(hypo)
                     new_beam_logp[prev_ix] = np.logaddexp(new_beam_logp[prev_ix], hypo_logp)
+                    if debug:
+                        print('Already in beam')
 
                 elif hypo_logp + beam_spread >= best_finished_logp:
                     new_surface_beam.append(hypo)
@@ -158,7 +166,11 @@ class BeamSearchInserts:
                     new_R_beam.append(new_R)
                     new_prod_order_beam.append(new_prod_order)
                     new_beam_logp.append(hypo_logp)
+                    if debug:
+                        print('Adding to beam. Surface order is ({}) while prod order is ({})'.format(hypo, prod_hypo))
                 else:
+                    if debug:
+                        print('Pruned')
                     pass  # pruned by beam spread
 
             surface_beam, beam_logp, prod_beam, R_beam, prod_order_beam = new_surface_beam, new_beam_logp, new_prod_beam, new_R_beam, new_prod_order_beam

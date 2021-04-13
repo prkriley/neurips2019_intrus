@@ -542,6 +542,7 @@ class FixedOrderTrainer(SampleBasedTrainer):
 
         if eos_coeff is None:
             xent_numerator = tf.reduce_sum(xent_values)
+            xent_numerator = tf.Print(xent_numerator, [xent_numerator], "xent_numerator: ", summarize=1000)
         else:
             samples_per_line = tf.to_float(batch_ph['ref_len'])
             weights = tf.where(should_finish,

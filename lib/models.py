@@ -8,6 +8,8 @@ import lib.layers
 from . import layers, ops
 from .data import linelen
 
+DEBUG_TRACE=True
+
 
 class Transformer:
 
@@ -138,19 +140,25 @@ class Transformer:
             # to the first position hence length is increased by 1
 
             out_padded = tf.concat([tf.zeros_like(out[:, :1]), out], axis=1)  # [batch_size, nout+1]
-            #out_padded = tf.Print(out_padded, [out_padded[0]], "out_padded[0]{}: ".format("t" if is_train else "i"), summarize=100)
+            if DEBUG_TRACE:
+                out_padded = tf.Print(out_padded, [out_padded[0]], "out_padded[0]{}: ".format("t" if is_train else "i"), summarize=100)
             dec_emb = self.emb_out(out_padded, offset='random' if self.dst_rand_offset else 0)
             # ^-- shape: [batch_size, nout + 1] #NOTE(prkriley): this may not be the right shape; surely there's a d_emb dim?; shoud be batch * ninp * emb_dim, where ninp is nout+1
             #NOTE(prkriley): emb_out's call method calls ops.make_transformer_timing_signal which will have to change with relative encodings
 
             # run decoder
-            #relative_positions = tf.Print(batch['relative_positions'], [batch['relative_positions'][0]], "batch[relative_positions][0]: ", summarize=1000)
 
             attn_mask = ops.make_causal_attn_mask(out_padded, out_len + 1)  # [batch_size, 1, nout + 1, nout + 1]
             #NOTE(prkriley): n_q is nout+1, inp_dim is emb_dim, n_kv is nout+1, output_depth is hid_size
             #TODO(prkriley): This needs to have the relative encoding stuff
-            dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
-                                      enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=batch['relative_positions'])
+            if DEBUG_TRACE:
+                relative_positions = tf.Print(batch['relative_positions'], [batch['relative_positions'][0,:7,:7]], "batch[relative_positions][0,:7,:7]: ", summarize=1000)
+                dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
+                                      enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=relative_positions)
+            else:
+
+                dec_out, _ = self.decoder(dec_emb, self_attn_mask=attn_mask,
+                                          enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=batch['relative_positions'])
                                       #enc_out=enc['out'], enc_attn_mask=enc['attn_mask'], relative_positions=relative_positions)
             # ^-- [batch_size, nout + 1, hid_size]
             #NOTE(prkriley): in second dimension, some suffix is bogus (represents timesteps past termination)
@@ -181,16 +189,22 @@ class Transformer:
                 #may be covered already by later masking
             H_prime = dec_out[:,:-1,:] # [batch_size, T, hid_size] or [batch_size, P-1, hid_size] depending on context
             #TODO(prkriley): some suffix of second dimension (per batch index) is bogus, verify using correctly
-            #out_len = tf.Print(out_len, [out_len[0]], "out_len[0]: ", summarize=1000)
-            #H = tf.Print(H, [H[0,:,:5]], "H[0,:,:5]: ", summarize=1000)
+            if DEBUG_TRACE:
+                out_len = tf.Print(out_len, [out_len[0]], "out_len[0]: ", summarize=1000)
+                #H = tf.Print(H, [H[0,:5,:5]], "H[0,:5P,:5]: ", summarize=1000)
             if not is_train:
                 #TODO(prkriley): out_len max value is T, so to index need out_len-1
-                #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]pre: ", summarize=1000)
+                if DEBUG_TRACE:
+                    pass
+                    #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]pre: ", summarize=1000)
                 H_prime = tf.batch_gather(H_prime, out_len[:, None] - 1) # [batch_size, T=1, hid_size]
-                #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]post: ", summarize=1000)
-            else:
+                if DEBUG_TRACE:
+                    pass
+                    #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]post: ", summarize=1000)
+            elif DEBUG_TRACE:
                 pass
-                #H_prime = tf.Print(H_prime, [H_prime[0,:,:5]], "H_prime[0,:,:5]train: ", summarize=1000)
+                #H_prime = tf.Print(H_prime, [H_prime[0,:5,:5]], "H_prime[0,:T/P-1,:5]train: ", summarize=1000)
+
             position_selector = self.logits_D(H) # [batch_size, P, hid_size]
             timestep_selector_for_position = self.logits_E(H_prime) # [batch_size, T, hid_size]
             #TODO(prkriley): instead of -1, need to gather by actual last valid index
@@ -226,10 +240,12 @@ class Transformer:
             else:
                 #NOTE(prkriley): tf.zeros because position_logp has already had the T dimension trimmed to the correct single value
                 finish_logp_indices = tf.stack([tf.range(batch_size)[:, None], tf.zeros(tf.shape(out_len[:, None]), dtype=out_len.dtype), out_len[:, None]], axis=-1) # [batch_size, T=1, 3]
-            #position_logp = tf.Print(position_logp, [position_logp[0]], "position_logp[0]: ", summarize=1000)
-            #finish_logp_indices = tf.Print(finish_logp_indices, [finish_logp_indices[0]], "finish_logp_indices[0]: ", summarize=1000)
+            if DEBUG_TRACE:
+                position_logp = tf.Print(position_logp, [position_logp[0,:5,:5]], "position_logp[0,:5T,:5P]: ", summarize=1000)
+                finish_logp_indices = tf.Print(finish_logp_indices, [finish_logp_indices[0,:5,:]], "finish_logp_indices[0,:5T,:]: ", summarize=1000)
             finish_logp = tf.gather_nd(position_logp, finish_logp_indices) # [batch_size, T]
-            #finish_logp = tf.Print(finish_logp, [finish_logp[0]], "finish_logp[0]: ", summarize=1000)
+            if DEBUG_TRACE:
+                finish_logp = tf.Print(finish_logp, [finish_logp[0,:5]], "finish_logp[0,:5T]: ", summarize=1000)
             #NOTE(prkriley): invalid positions in T dimension of finish_logp should have same value as the 1 true position
 
             #TODO(prkriley): check whether truncing position_logp in 3rd dimnsion is correct; the last is NOT in general the terminate index, out_len determines; tpm is sanitary in 3rd, not in 2nd
@@ -239,7 +255,8 @@ class Transformer:
                                             position_logp[:,:,:-1], 
                                             tf.fill(tf.shape(position_logp[:,:,:-1]), -1e9)) # [batch_size, T, P-1]
             #TODO(prkriley): why is this not printing?
-            #insert_position_logp = tf.Print(insert_position_logp, [insert_position_logp[0]], "insert_position_logp[0]: ", summarize=1000)
+            if DEBUG_TRACE:
+                insert_position_logp = tf.Print(insert_position_logp, [insert_position_logp[0,:5,:5]], "insert_position_logp[0,:5T,:5P-1]: ", summarize=1000)
             #TODO(prkriley): is :-1 ok here? YES because combined with -1e9-masked insert_position_logp
             time_position_selector_for_tokens = self.logits_F(H_prime)[:,:,None,:] + position_selector[:,None,:-1,:] # [batch_size, T, P-1, hid_size]
             #if is_train:
@@ -250,11 +267,13 @@ class Transformer:
                 #timestep_selector_for_position = tf.batch_gather(timestep_selector_for_position, out_len[:, None]) # [batch_size, T=1, hid_size]
             token_logits = self.logits_W(time_position_selector_for_tokens) # [batch_size, T, P-1, V]
 
-            #token_logits = tf.Print(token_logits, [tf.shape(token_logits)], "token_logits.shape: ", summarize=4)
+            if DEBUG_TRACE:
+                token_logits = tf.Print(token_logits, [tf.shape(token_logits)], "token_logits.shape: ", summarize=4)
             token_logp_given_position = tf.nn.log_softmax(token_logits, axis=-1)
 
             insert_logp = insert_position_logp[:,:,:,None] + token_logp_given_position # [batch_size, T, P-1, V]
-            #insert_logp = tf.Print(insert_logp, [insert_logp[0]], "insert_logp[0]: ", summarize=1000)
+            if DEBUG_TRACE:
+                insert_logp = tf.Print(insert_logp, [insert_logp[0,:5,:5,:10]], "insert_logp[0,:5T,:5P-1,:10V]: ", summarize=1000)
             
         return {
             'insert': insert_logp,  # [batch_size, T, nout, voc_size]
