@@ -1,3 +1,4 @@
+NOTE: below is the original README from the repo I forked. My code changes are present in the renorm branch. The refactor branch is also mine but does not yet work.
 # INTRUS
 Supplementary code for NeurIPS submission "Sequence Modeling with Unconstrained Generation Order"([arxiv](https://arxiv.org/abs/1911.00176)). This code trains and applies a machine translation model that can generate sequences in arbitrary order
 
