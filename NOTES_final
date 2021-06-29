@@ -1,0 +1,80 @@
+[Tue Feb  2 14:58:03 EST 2021]: Need to figure out interaction of CUDA_VISIBLE_DEVICES, number of parallel batches, time/iteration, and how many actual updates were made
+[Tue Feb  2 20:18:22 EST 2021]: Need to fix the weird batching on dev data! Only evals on 256 each time...
+[Tue Feb  2 20:22:31 EST 2021]: In experiment names, NUM_GPU is just num_buffers for the batcher which may not actually affect the number of GPUs utilized, which may always be all available
+[Tue Feb  2 23:49:39 EST 2021]: Using more gpus is faster; time/it is higher but remember that I also tripled the data/it so it's good
+[Wed Feb  3 10:21:51 EST 2021]: Pretrain progress seems to be stuck; maybe just a few minutes, but only the TITAN V (which is 1 in nvidia-smi but 0 in reality I think?) is working, though all have memory usage
+[Wed Feb  3 10:29:08 EST 2021]: It continued; I guess it was just doing the update synchronization
+[Wed Feb 10 10:50:24 EST 2021]: Found empty reference despite filtered data; I suspect I haven't done the filtering here?
+[Wed Feb 10 10:53:48 EST 2021]: Corrected; note that the pretrained model I have was pretrained on unfiltered data (meaning some empty inputs / refs)
+[Thu Feb 11 16:17:58 EST 2021]: Somehow running very slowly, 20sec/it
+[Thu Feb 11 16:22:07 EST 2021]: I think it's because of the weird range(2) thing in the batching; double the data size perhaps?
+[Wed Feb 17 10:15:06 EST 2021]: We should adjust the PQ code so it doesn't cause a slowdown when disabled
+[Mon Mar  1 11:36:42 EST 2021]: train_50k_3gpu finished
+[Mon Mar  1 15:32:35 EST 2021]: Refactoring; hypo repurposed to just the ref (in correct order, not generation order)
+[Mon Mar  1 15:32:53 EST 2021]: Remember that hypo gets renamed to out
+[Mon Mar  1 18:15:03 EST 2021]: Need to figure out whether nout+1 (position) is same as time
+[Mon Mar  1 23:09:52 EST 2021]: Still untested, but finished first refactor pass through compute_action_logprobs
+[Tue Mar  2 22:59:18 EST 2021]: OOM with refactor; adding the extra nout dimension T is a significant price, will have to adjust batch size down accordingly
+[Tue Mar  2 23:57:30 EST 2021]: Finally got first non-crash! Note that lots of stuff is wrong: production order is wrong (I think? double-check), positional embeddings are wrong, and some things need to be checked (including decoding)
+[Mon Mar  8 16:13:43 EST 2021]: Attention mask done, but double-check inference; token_logits.shape is sometimes [1 1 1...] which seems weird and wrong
+[Mon Mar  8 18:54:15 EST 2021]: Ok that's the beam search, starts with 1 and fans-out to 32 (sometimes fewer apparently)
+[Tue Mar  9 12:16:33 EST 2021]: Got OOM on the monument-to-sin translation when got to tensors of shape [4 77 77 V]
+[Tue Mar  9 15:54:59 EST 2021]: Note that relative matrix R is expanded out to PxP with zeros, which are valid indices; adding att_bias should make them not matter though
+[Tue Mar  9 16:24:50 EST 2021]: Need to deal with fact that we can't just take the last timestep, have to actually take the last valid timestep
+[Wed Mar 10 09:36:01 EST 2021]: pretraining with refactor progressing but output in first 4000 steps seems bogus
+[Wed Mar 10 09:36:54 EST 2021]: Real pretrain run also was bogus at step 4000 so it might be ok, though the nature of the bogus-ness was perhaps a bit different
+[Mon Mar 22 10:31:39 EDT 2021]: Refactored pretraining after 4950 steps on 1 gpu has done same number of updates as 50k steps on 3 gpus of baseline with 1 sample per line, BUT BLEU is not good, and is comparable to baseline after 4000 steps; either something is wrong or additional updates from same data not very effective
+[Mon Mar 22 10:31:53 EDT 2021]: Need to test on 1 datapoint like Dan suggested
+[Mon Mar 22 20:24:38 EDT 2021]: On dataset of 1 sentence (repeated 256 times), takes 1100 steps (not 1000) to get good performance with baseline pretraining
+[Tue Mar 23 12:26:07 EDT 2021]: PROBLEM: refactor does not seem to be learning on the dataset of one example
+[Tue Mar 23 12:52:29 EDT 2021]: NOTE: relative positions were very wrong (incorrect port from -1/0/1/ to 0/1/2)
+[Tue Mar 23 15:53:37 EDT 2021]: In models.py, around line 219, TODO: position_logp is clipped in last dim but this does NOT remove the log_prob for termination for anything other than the longest sequence
+[Tue Mar 23 15:55:50 EDT 2021]: Actually already good, time_position_mask clipping with 1: handles it
+[Tue Mar 23 21:09:43 EDT 2021]: Even after theoretically fixing relative positions, still not learning on one example dataset (toy1)
+[Tue Mar 23 21:11:50 EDT 2021]: Note that it is possible it will take longer than baseline because there are more parameters that need to be learned, so I'll let it run, but we should do some debugging, maybe need to test a modeling change as well
+[Tue Mar 23 21:12:33 EDT 2021]: It would be very helpful to find a setting where the baseline can learn quickly; look into fixing l2r order perhaps and tweaking learning rate
+[Wed Mar 24 10:48:12 EDT 2021]: Even after 3k steps, STILL not learning; definitely a bug
+[Wed Mar 24 19:21:59 EDT 2021]: Over 5000 steps on toy1, refactor spent a long time just outputting one correct partial token, then shifted to the first word, then to repeating that first word
+[Thu Mar 25 15:14:44 EDT 2021]: With toy2 (a b) example, baseline takes less than 200 steps at batch size 16
+[Mon Mar 29 12:22:01 EDT 2021]: refactor does not solve toy2 (a b) even within 4900 steps
+[Tue Mar 30 13:13:53 EDT 2021]: H_prime in train mode APPEARS to always be picking the first one instead of out_len? maybe need to do out_len-1 or something
+[Tue Mar 30 14:20:37 EDT 2021]: Yeah, using out_len-1 for trimming H_prime has fixed the toy2 setting, now to go back to toy1 and then real
+[Tue Mar 30 14:25:24 EDT 2021]: Spoke too soon; it seems to work in the 1ref setting, but Nref seems bad still; investigating
+[Tue Mar 30 14:36:30 EDT 2021]: Possible that l2r training + Nref means you have to get lucky, because otherwise you end up in unknown space after first output; switch to random and make sure it still works
+[Tue Mar 30 15:29:38 EDT 2021]: One possibility is the change to using logsumexp instead of einsum for FixedORderTrainer; only refactor did that
+[Tue Mar 30 15:29:57 EDT 2021]: Let's switch it back I guess
+[Tue Mar 30 15:41:54 EDT 2021]: Switching back to ein didn't immediately fix it
+[Tue Mar 30 18:38:37 EDT 2021]: I believe it is an inference problem; training traces look reasonable, even at the point where inference is failing, so need to figure out what's up
+[Tue Mar 30 21:15:25 EDT 2021]: Switching EOS to beginning seems to have fixed the toy2 Nref random_order situation
+[Mon Apr  5 19:05:13 EDT 2021]: Refactor on toy1 didn't seem to be doing well with Nref_b256_rnd, but 1ref_b64_l2r got it memorized in 200 steps
+[Mon Apr  5 19:06:21 EDT 2021]: Try 1ref_rnd I guess?
+[Mon Apr  5 21:54:00 EDT 2021]: 1ref_rnd_b64 didn't get anywhere good in 250 steps; need to check again what expectation is
+[Mon Apr  5 21:56:29 EDT 2021]: Baseline (Nref, rnd, b256, 3gpu [unlike 1gpu for current debug experiments]) had it in step_1100, not in step_1000. Not sure on update number (sampling perhaps) but exp should be able to get in let's say 4k steps at b256 with 1 gpu
+[Tue Apr  6 21:04:03 EDT 2021]: Accidentally killed screen session, have an orphaned job writing to refactor_toy3_debug_1ref_l2r_ein_beos_4k_verbose.out
+[Tue Apr  6 21:04:10 EDT 2021]: pid 25533
+[Tue Apr  6 21:15:22 EDT 2021]: Inspecting its debug output, seems like inference is basically right but A) terminates early (unsure if messed up prediction or beam business) and B) chosen output does not appear to be the right one in the debugging
+[Tue Apr  6 21:19:46 EDT 2021]: Printed output is weird; instead of 'a b a c d a e f b g a h c' it puts 'a b d c e a b f a g c' which can be thought of as skipping the first a then doing a weird alternating thing (1 0 3 2 5 4 etc)
+[Tue Apr  6 21:20:14 EDT 2021]: Could be a coincidence. Things to try: redo with expanded logging to really see full distributions, AND double-check inference/beam search stuff
+[Tue Apr  6 21:20:50 EDT 2021]: Could also simply try with a bigger beam size (currently 2; could go up to 8 with vocab)
+[Tue Apr  6 23:02:50 EDT 2021]: Tried with beam 5; loss keeps going down but output is wrong... It smells like a bug but haven't dug into the traces yet
+[Tue Apr  6 23:31:41 EDT 2021]: I think it is some sort of complication from moving EOS to the beginning; need to track it down
+[Tue Apr  6 23:45:40 EDT 2021]: toy4 (a b c d) was memorized easily; not sure why the problem is so finnicky
+[Tue Apr  6 23:46:17 EDT 2021]: I'm going to redefine toy4 to something slightly longer and nonmonotonic
+[Tue Apr  6 23:52:05 EDT 2021]: (a b a c d) also memorized easily
+[Tue Apr  6 23:54:54 EDT 2021]: Turns out I only had 1 line in the english input for toy3, so earlier runs were running at 1/16th effective batch size I think
+[Wed Apr  7 00:03:52 EDT 2021]: Deleted all old toy3 runs, will retry with correct one
+[Wed Apr  7 00:05:35 EDT 2021]: Note I don't think it's a 16x efficiency thing; I think that maybe 15/16 examples had empty input?
+[Wed Apr  7 00:18:31 EDT 2021]: Still not sure of the problem; (a b a c d a e a) memorized fine
+[Wed Apr  7 10:02:21 EDT 2021]: Still have problems, but model-side inference traces seem to be correct but A) terminate early and B) at the end they don't correspond to the outputs actually being printed
+[Wed Apr  7 10:09:51 EDT 2021]: Really looks like model is learning correctly but inference code is doing something wrong, BUT doesn't explain why output changes with iterations; if model always choosing correctly, why wouldn't inference always produce the SAME wrong output?
+[Mon Apr 12 15:34:12 EDT 2021]: NOTE: EOS change affected encoder too, but maybe shouldn't; how about we make an arg for to_matrix and keep eos at end for encoder. also check all instances of infer_length
+[Mon Apr 12 15:35:57 EDT 2021]: update: infer_length includes first eos in count, so it should work fine
+[Mon Apr 12 15:37:04 EDT 2021]: We should see whether EOS at beginning messes up our masking though
+[Mon Apr 12 16:12:00 EDT 2021]: PROBLEM: decoding terminated because of max_steps because the toy input was length 3, 3*2+3 is less than requested output
+[Mon Apr 12 16:22:07 EDT 2021]: YAY! With fix, refactor l2r_1ref solves toy4 in 200 steps
+[Mon Apr 12 16:22:20 EDT 2021]: let's do random_Nref next
+[Mon Apr 12 16:36:25 EDT 2021]: Note that toy3 had the same problem
+[Tue Apr 13 12:58:40 EDT 2021]: refactor on toy4fixed Nref_rnd_bm8_b256 does not memorize within 2500 steps
+[Wed Apr 14 10:39:57 EDT 2021]: Pretrain with b256_Nref_rnd solves toy4fixed in 200 steps, so we definitely have a problem with the refactor
+[Wed Apr 14 10:40:25 EDT 2021]: Note that that pretrain run had samples=None (meaning trained on every time step every time)
+[Wed Apr 14 10:41:23 EDT 2021]: Unsure what to do next; maybe investigate masking to see if the EOS change altered what we want (might be a +/- 1 on some ranges for example)
